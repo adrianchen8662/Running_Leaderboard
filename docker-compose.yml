@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    image: running-leaderboard
+    restart: unless-stopped
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - leaderboard_data:/app/data
+
+volumes:
+  leaderboard_data:
