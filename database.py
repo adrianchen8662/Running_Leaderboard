@@ -1,5 +1,6 @@
+import json
 import os
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 import aiosqlite
 
 DB_PATH = os.getenv("DB_PATH", "leaderboard.db")
@@ -14,17 +15,23 @@ class Database:
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    discord_user_id TEXT    NOT NULL,
-                    discord_username TEXT   NOT NULL,
-                    run_date        TEXT,
-                    mile_time       REAL,
-                    fivek_time      REAL,
-                    filename        TEXT,
-                    uploaded_at     TEXT    DEFAULT CURRENT_TIMESTAMP
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    discord_user_id  TEXT    NOT NULL,
+                    discord_username TEXT    NOT NULL,
+                    run_date         TEXT,
+                    mile_time        REAL,
+                    fivek_time       REAL,
+                    filename         TEXT,
+                    stats_json       TEXT,
+                    uploaded_at      TEXT    DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
+            # Non-destructive migration for databases created before stats_json existed
+            try:
+                await db.execute("ALTER TABLE runs ADD COLUMN stats_json TEXT")
+            except Exception:
+                pass  # column already exists
             await db.commit()
 
     async def add_run(
@@ -35,24 +42,46 @@ class Database:
         mile_time: Optional[float],
         fivek_time: Optional[float],
         filename: str,
-    ) -> None:
+        stats: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Insert a run and return its new row id."""
         async with aiosqlite.connect(self.path) as db:
-            await db.execute(
+            cur = await db.execute(
                 """
                 INSERT INTO runs
                     (discord_user_id, discord_username, run_date,
-                     mile_time, fivek_time, filename)
-                VALUES (?, ?, ?, ?, ?, ?)
+                     mile_time, fivek_time, filename, stats_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (discord_user_id, discord_username, run_date,
-                 mile_time, fivek_time, filename),
+                (
+                    discord_user_id, discord_username, run_date,
+                    mile_time, fivek_time, filename,
+                    json.dumps(stats) if stats else None,
+                ),
             )
             await db.commit()
+            return cur.lastrowid
+
+    async def get_run_by_id(self, run_id: int) -> Optional[Dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                """
+                SELECT discord_user_id, discord_username, stats_json
+                FROM runs WHERE id = ?
+                """,
+                (run_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            return {
+                "user_id":  row[0],
+                "username": row[1],
+                "stats":    json.loads(row[2]) if row[2] else None,
+            }
 
     async def get_leaderboard(self, event: str) -> List[Tuple[str, float]]:
-        """Return (username, best_time) pairs ordered fastest first."""
         col = "mile_time" if event == "mile" else "fivek_time"
-        # Use the most-recently uploaded display name for each user
         query = f"""
             SELECT
                 (
@@ -76,8 +105,7 @@ class Database:
             cur = await db.execute(
                 """
                 SELECT MIN(mile_time), MIN(fivek_time), COUNT(*)
-                FROM runs
-                WHERE discord_user_id = ?
+                FROM runs WHERE discord_user_id = ?
                 """,
                 (discord_user_id,),
             )
@@ -89,10 +117,11 @@ class Database:
     async def get_recent_runs(
         self, discord_user_id: str, limit: int = 5
     ) -> List[tuple]:
+        """Returns (id, run_date, mile_time, fivek_time, filename) tuples."""
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
                 """
-                SELECT run_date, mile_time, fivek_time, filename
+                SELECT id, run_date, mile_time, fivek_time, filename
                 FROM runs
                 WHERE discord_user_id = ?
                 ORDER BY id DESC

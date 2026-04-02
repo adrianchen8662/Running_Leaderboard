@@ -98,13 +98,14 @@ async def upload(
         )
         return
 
-    await db.add_run(
+    run_id = await db.add_run(
         discord_user_id=str(target.id),
         discord_username=target.display_name,
         run_date=stats.get("date"),
         mile_time=stats.get("mile_time"),
         fivek_time=stats.get("fivek_time"),
         filename=gpx_file.filename,
+        stats=stats,
     )
 
     embed = discord.Embed(
@@ -128,8 +129,10 @@ async def upload(
     if stats.get("date"):
         embed.add_field(name="Date", value=stats["date"], inline=True)
 
+    footer = f"Run #{run_id}"
     if runner and runner != interaction.user:
-        embed.set_footer(text=f"Uploaded by {interaction.user.display_name}")
+        footer += f"  ·  Uploaded by {interaction.user.display_name}"
+    embed.set_footer(text=footer)
 
     await interaction.followup.send(embed=embed)
 
@@ -144,18 +147,45 @@ async def upload(
 
 @bot.tree.command(
     name="insights",
-    description="Get a Gemini AI coaching analysis of a run from a GPX file.",
+    description="Get a Gemini AI coaching analysis of a run.",
 )
 @app_commands.describe(
-    gpx_file="GPX file to analyse.",
-    runner="Who ran this? (affects the personalised coaching tone)",
+    run_id="ID of a previously uploaded run (shown in /runs and /upload).",
+    gpx_file="GPX file to analyse instead of a stored run.",
+    runner="Who ran this? Defaults to you (only needed with gpx_file).",
 )
 async def insights_cmd(
     interaction: discord.Interaction,
-    gpx_file: discord.Attachment,
+    run_id: int = None,
+    gpx_file: discord.Attachment = None,
     runner: discord.Member = None,
 ):
     await interaction.response.defer()
+
+    if run_id is not None:
+        row = await db.get_run_by_id(run_id)
+        if not row:
+            await interaction.followup.send(f"No run found with ID #{run_id}.")
+            return
+        if not row["stats"]:
+            await interaction.followup.send(
+                f"Run #{run_id} was uploaded before AI insights were supported. "
+                "Re-upload the GPX file to get an analysis."
+            )
+            return
+        # Resolve display name from the guild if possible
+        member = interaction.guild.get_member(int(row["user_id"])) if interaction.guild else None
+        target_name = member.display_name if member else row["username"]
+        target = member or interaction.user
+        target.display_name  # just used for avatar below
+        await _send_insights(interaction, row["stats"], target, override_name=target_name)
+        return
+
+    if gpx_file is None:
+        await interaction.followup.send(
+            "Provide either a `run_id` (from `/runs`) or a `gpx_file`."
+        )
+        return
 
     if not gpx_file.filename.lower().endswith(".gpx"):
         await interaction.followup.send("Please upload a `.gpx` file.")
@@ -185,20 +215,22 @@ async def _send_insights(
     interaction: discord.Interaction,
     stats: dict,
     target: discord.Member,
+    override_name: str = None,
 ) -> None:
     """Call Gemini and post the coaching embed. Works from both commands."""
+    display_name = override_name or target.display_name
     thinking = await interaction.followup.send("Asking Gemini for insights… 🤔")
 
     try:
-        analysis = await get_insights(stats, target.display_name, GEMINI_API_KEY)
+        analysis = await get_insights(stats, display_name, GEMINI_API_KEY)
     except Exception:
         print(traceback.format_exc())
         await thinking.edit(content="Gemini analysis failed. Check the logs.")
         return
 
     embed = discord.Embed(
-        title=f"AI Run Analysis — {target.display_name}",
-        description=analysis[:4096],  # embed description cap
+        title=f"AI Run Analysis — {display_name}",
+        description=analysis[:4096],
         color=discord.Color.purple(),
     )
     embed.set_thumbnail(url=target.display_avatar.url)
@@ -305,13 +337,13 @@ async def runs(interaction: discord.Interaction, runner: discord.Member = None):
         color=discord.Color.blurple(),
     )
 
-    for date, mile, fivek, fname in recent:
+    for run_id, date, mile, fivek, fname in recent:
         parts = []
         if mile:
             parts.append(f"Mile: `{fmt_time(mile)}`")
         if fivek:
             parts.append(f"5K: `{fmt_time(fivek)}`")
-        label = date or fname or "Unknown date"
+        label = f"#{run_id}  {date or fname or 'Unknown date'}"
         embed.add_field(name=label, value="  ·  ".join(parts) or "No timed segments", inline=False)
 
     await interaction.response.send_message(embed=embed)
