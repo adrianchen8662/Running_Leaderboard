@@ -1,0 +1,10 @@
+.git
+.gitignore
+context-transfer/
+__pycache__/
+*.pyc
+*.db
+.env
+README.md
+DOCKER.md
+docker-compose.yml

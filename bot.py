@@ -63,18 +63,19 @@ def rank_str(i: int) -> str:
 
 
 def _pr_fields(embed: discord.Embed, bests: dict) -> bool:
-    """Add a field per PR the runner holds. Returns True if any were added."""
+    """Add a field for every tracked distance. Distances the runner hasn't
+    logged still get a slot — otherwise a new event looks like it's missing
+    from the bot rather than from their history. Returns True if any PR
+    was actually set."""
     added = False
     for key, (label, emoji, meters) in EVENTS.items():
         secs = bests.get(EVENT_COLUMNS[key])
-        if not secs:
-            continue
-        embed.add_field(
-            name=f"{emoji} {label}",
-            value=f"`{fmt_time(secs)}`\n{fmt_pace_mi(pace_per_mile(secs, meters))}",
-            inline=True,
-        )
-        added = True
+        if secs:
+            value = f"`{fmt_time(secs)}`\n{fmt_pace_mi(pace_per_mile(secs, meters))}"
+            added = True
+        else:
+            value = "`—`\n*not logged yet*"
+        embed.add_field(name=f"{emoji} {label}", value=value, inline=True)
     return added
 
 
@@ -351,8 +352,10 @@ async def leaderboard(interaction: discord.Interaction, event: str = None):
     results = await asyncio.gather(*(db.get_leaderboard(k) for k in keys))
 
     if not any(results):
+        where = f"{EVENTS[event][0]} times" if event else "times"
         await interaction.response.send_message(
-            "No times on the board yet. Upload a run with `/upload`!"
+            f"No {where} on the board yet. Record one with `/upload`, or enter "
+            f"it by hand with `/logtime`."
         )
         return
 
@@ -368,15 +371,13 @@ async def leaderboard(interaction: discord.Interaction, event: str = None):
     else:
         embed = discord.Embed(title="🏃 Leaderboard", color=discord.Color.orange())
         for key, rows in zip(keys, results):
-            if not rows:
-                continue
             label, emoji, _ = EVENTS[key]
             embed.add_field(
                 name=f"{emoji} {label}",
                 value="\n".join(
                     f"{rank_str(i)}  **{u}** — `{fmt_time(t)}`"
                     for i, (u, t) in enumerate(rows)
-                ),
+                ) or "*No times yet*",
                 inline=True,
             )
         embed.set_footer(text="/profile for predictions and runner type")
@@ -388,7 +389,8 @@ async def leaderboard(interaction: discord.Interaction, event: str = None):
 # Profile embeds — shared by /profile, /pb and /runs
 # ---------------------------------------------------------------------------
 
-def _build_overview_embed(target, bests: dict, profile: dict, total_km) -> discord.Embed:
+def _build_overview_embed(target, bests: dict, profile: dict, dist: dict) -> discord.Embed:
+    dist = dist or {}
     embed = discord.Embed(
         title=f"Profile — {target.display_name}",
         color=discord.Color.blue(),
@@ -422,13 +424,27 @@ def _build_overview_embed(target, bests: dict, profile: dict, total_km) -> disco
     summary = [f"**{bests['run_count']}** run{'s' if bests['run_count'] != 1 else ''} logged"]
     if bests["gps_count"]:
         summary.append(f"**{bests['gps_count']}** GPS-verified 📍")
-    if total_km:
-        summary.append(f"**{total_km:.1f} km** tracked")
+    if dist.get("total_km"):
+        summary.append(f"**{dist['total_km']:.1f} km** tracked")
     if profile.get("vdot"):
         summary.append(f"VDOT **{profile['vdot']:.1f}**")
     if profile.get("cs_pace_s_mi"):
         summary.append(f"threshold ~**{fmt_pace_mi(profile['cs_pace_s_mi'])}**")
     embed.add_field(name="📊 Stats", value="  ·  ".join(summary), inline=False)
+
+    if dist.get("longest_km"):
+        longest = f"**{dist['longest_km']:.2f} km**"
+        if dist.get("longest_miles"):
+            longest += f"  ({dist['longest_miles']:.2f} mi)"
+        detail = "  ·  ".join(
+            p for p in (dist.get("longest_date"), f"`{dist['longest_tag']}`"
+                        if dist.get("longest_tag") else None) if p
+        )
+        embed.add_field(
+            name="🏔️ Longest Run",
+            value=f"{longest}\n{detail}" if detail else longest,
+            inline=False,
+        )
 
     if bests["first_date"] and bests["last_date"]:
         span = bests["first_date"]
@@ -533,13 +549,13 @@ def _build_history_embed(target, runs: list, page: int, total: int) -> discord.E
 class ProfileView(discord.ui.View):
     """Tabbed profile: overview, predictions and a paged run history."""
 
-    def __init__(self, target, bests: dict, profile: dict, total_km, total_runs: int,
+    def __init__(self, target, bests: dict, profile: dict, dist: dict, total_runs: int,
                  page: str = "overview"):
         super().__init__(timeout=300)
         self.target = target
         self.bests = bests
         self.profile = profile
-        self.total_km = total_km
+        self.dist = dist
         self.total_runs = total_runs
         self.history_page = 0
         self.message: discord.Message | None = None
@@ -567,7 +583,7 @@ class ProfileView(discord.ui.View):
 
     async def _render(self, interaction: discord.Interaction) -> None:
         if self.page == "overview":
-            embed = _build_overview_embed(self.target, self.bests, self.profile, self.total_km)
+            embed = _build_overview_embed(self.target, self.bests, self.profile, self.dist)
         elif self.page == "predictions":
             embed = _build_predictions_embed(self.target, self.profile)
         else:
@@ -582,7 +598,7 @@ class ProfileView(discord.ui.View):
 
     async def initial_embed(self) -> discord.Embed:
         if self.page == "overview":
-            return _build_overview_embed(self.target, self.bests, self.profile, self.total_km)
+            return _build_overview_embed(self.target, self.bests, self.profile, self.dist)
         if self.page == "predictions":
             return _build_predictions_embed(self.target, self.profile)
         runs = await db.get_runs(str(self.target.id), limit=RUNS_PER_PAGE)
@@ -629,9 +645,9 @@ class ProfileView(discord.ui.View):
 async def _send_profile(interaction: discord.Interaction, runner, page: str) -> None:
     """Load a runner's data once and hand it to a ProfileView."""
     target = runner or interaction.user
-    bests, total_km = await asyncio.gather(
+    bests, dist = await asyncio.gather(
         db.get_personal_bests(str(target.id)),
-        db.get_total_distance_km(str(target.id)),
+        db.get_distance_stats(str(target.id)),
     )
 
     if not bests:
@@ -642,7 +658,7 @@ async def _send_profile(interaction: discord.Interaction, runner, page: str) -> 
         return
 
     profile = race_analysis.build_profile(bests)
-    view = ProfileView(target, bests, profile, total_km, bests["run_count"], page=page)
+    view = ProfileView(target, bests, profile, dist, bests["run_count"], page=page)
     await interaction.response.send_message(embed=await view.initial_embed(), view=view)
     view.message = await interaction.original_response()
 

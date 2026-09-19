@@ -250,23 +250,38 @@ class Database:
             return None
         return dict(row)
 
-    async def get_total_distance_km(self, discord_user_id: str) -> Optional[float]:
-        """Total GPS-recorded distance. Manual entries have no distance, so
-        this only covers uploaded runs."""
+    async def get_distance_stats(self, discord_user_id: str) -> Dict[str, Any]:
+        """Total and longest GPS-recorded distance, in one pass over the
+        runner's stored stats. Manual entries carry no distance, so this only
+        covers uploaded runs."""
         rows = await self._fetchall(
-            "SELECT stats_json FROM runs "
+            "SELECT tag, run_date, stats_json FROM runs "
             "WHERE discord_user_id = ? AND stats_json IS NOT NULL",
             (discord_user_id,),
         )
+        stats: Dict[str, Any] = {
+            "total_km": None, "longest_km": None,
+            "longest_miles": None, "longest_date": None, "longest_tag": None,
+        }
         total = 0.0
         for row in rows:
             try:
-                dist = json.loads(row["stats_json"]).get("total_dist_km")
+                parsed = json.loads(row["stats_json"])
+                dist = parsed.get("total_dist_km")
             except (ValueError, TypeError, AttributeError):
                 continue
-            if dist:
-                total += dist
-        return total or None
+            if not dist:
+                continue
+            total += dist
+            if stats["longest_km"] is None or dist > stats["longest_km"]:
+                stats.update(
+                    longest_km=dist,
+                    longest_miles=parsed.get("total_dist_miles"),
+                    longest_date=row["run_date"],
+                    longest_tag=row["tag"],
+                )
+        stats["total_km"] = total or None
+        return stats
 
     async def count_runs(self, discord_user_id: str) -> int:
         row = await self._fetchone(

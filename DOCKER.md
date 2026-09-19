@@ -11,28 +11,28 @@
 
 ## Build and push
 
-Replace `yourusername` with your Docker Hub username.
+Always tag a version alongside `latest`, so a bad release can be rolled back
+by pinning the previous tag in `docker-compose.yml`:
 
 ```bash
-docker build -t adrianchen8662/running-leaderboard:latest .
+docker build -t adrianchen8662/running-leaderboard:v2.0 \
+             -t adrianchen8662/running-leaderboard:latest .
+```
+
+Check the image actually starts before pushing it — this imports every module
+inside the container, which catches a module missing from the `COPY` line:
+
+```bash
+docker run --rm -e DISCORD_TOKEN=x -e GEMINI_API_KEY=x \
+  adrianchen8662/running-leaderboard:latest \
+  python -c "import bot; print('imports ok')"
+```
+
+Then push both tags:
+
+```bash
+docker push adrianchen8662/running-leaderboard:v2.0
 docker push adrianchen8662/running-leaderboard:latest
-```
-
-Tag a versioned release alongside `latest`:
-
-```bash
-docker build -t yourusername/running-leaderboard:v1.0 \
-             -t yourusername/running-leaderboard:latest .
-docker push yourusername/running-leaderboard:v1.0
-docker push yourusername/running-leaderboard:latest
-```
-
-## Update docker-compose.yml
-
-Replace the placeholder image name with your real one:
-
-```yaml
-image: yourusername/running-leaderboard:latest
 ```
 
 ## Deploy on the VM

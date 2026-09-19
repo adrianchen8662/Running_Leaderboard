@@ -1,6 +1,6 @@
 services:
   bot:
-    image: yourusername/running-leaderboard:latest
+    image: adrianchen8662/running-leaderboard:latest
     restart: unless-stopped
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
