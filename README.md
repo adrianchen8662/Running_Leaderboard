@@ -18,7 +18,8 @@ No Strava account required for anyone. Export a GPX from your watch, drop it in 
 | `/pb [runner:]` | Jump straight to the PR overview. |
 | `/runs [runner:]` | Jump straight to the paged run history. |
 | `/insights [tag:] [gpx_file:] [runner:]` | Gemini analysis of a stored run (by tag) or an attached GPX. |
-| `/remove tag:` | Delete a run by its tag. |
+| `/remove tag:` | Delete a run by its tag — removes its stored GPX too. |
+| `/reprocess` | Re-derive every stored run's times from its saved GPX. Requires **Manage Server**. |
 | `/weekly_summary` | Preview the Sunday wrap-up in the current channel. |
 
 Every run gets a short **tag** (e.g. `AB3KQ`) shown on upload and in `/runs` — that's what `/insights` and `/remove` take.
@@ -70,6 +71,27 @@ Also computed:
 
 ---
 
+## Stored GPX files
+
+Uploaded GPX files are retained, gzipped, in a separate `run_files` table (typically 5–12x compression). They sit in their own table so leaderboard queries never page through blob data.
+
+This exists so **new metrics can be applied to old runs**. When the 10K board was added, existing runs couldn't get a 10K — only derived stats had been kept, and those predated the 10K. With the source file retained, `/reprocess` re-derives every stored run's times, so a future distance, a new metric, or a parser fix reaches history instead of only future uploads.
+
+`/reprocess` is gated behind **Manage Server**, parses off the event loop so the bot stays responsive, and reports how many runs it rewrote.
+
+### Privacy and retention
+
+GPX tracks contain precise coordinates and timestamps — where people live and when they're out. The derived stats contain no coordinates at all, so retaining files is a real change in what the bot holds about your group.
+
+Retention is controlled by `GPX_RETENTION_DAYS`:
+
+- **`0`** (default) — keep indefinitely.
+- **`N`** — drop stored files older than N days, on startup. The runs and their times survive; only the source files go, so those runs can no longer be reprocessed.
+
+Files above 8 MB compressed are skipped; the run is still recorded.
+
+---
+
 ## Setup
 
 ```bash
@@ -83,6 +105,7 @@ DISCORD_TOKEN=your_discord_bot_token
 GEMINI_API_KEY=your_gemini_api_key
 DB_PATH=leaderboard.db        # optional, defaults to ./leaderboard.db
 GEMINI_MODEL=gemini-2.5-flash # optional
+GPX_RETENTION_DAYS=0          # optional, 0 = keep stored GPX forever
 ```
 
 The bot needs the **applications.commands** scope, and Message Content intent is *not* required. Then:
@@ -108,6 +131,6 @@ Slash commands sync on startup. For Docker and VM deployment, see [DOCKER.md](DO
 
 **Fastest-segment search:** a two-pointer sliding window over cumulative GPS distances, with linear interpolation at the trailing edge so a 4-second sampling gap doesn't cost you seconds on the clock.
 
-**Storage:** every run is kept forever — the database is append-only apart from `/remove`. Missing columns are added automatically on startup, so an existing database upgrades in place.
+**Storage:** every run is kept forever — the database is append-only apart from `/remove`. Missing columns and tables are added automatically on startup, so an existing database upgrades in place.
 
 > If you add a new module, add it to the `COPY` line in the `Dockerfile` too — it lists files explicitly.

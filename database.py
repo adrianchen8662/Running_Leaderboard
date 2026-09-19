@@ -1,4 +1,6 @@
 import asyncio
+import datetime
+import gzip
 import json
 import os
 import random
@@ -7,6 +9,14 @@ from typing import Optional, List, Tuple, Dict, Any
 import aiosqlite
 
 DB_PATH = os.getenv("DB_PATH", "leaderboard.db")
+
+# Raw GPX files are kept so new metrics can be derived from old runs later.
+# They contain precise coordinates and timestamps, so retention is capped by
+# GPX_RETENTION_DAYS; 0 (the default) keeps them indefinitely.
+GPX_RETENTION_DAYS = int(os.getenv("GPX_RETENTION_DAYS", "0"))
+# Skip storing anything above this compressed size -- the run is still
+# recorded, it just can't be reprocessed later.
+MAX_STORED_GPX_BYTES = 8 * 1024 * 1024
 
 # Unambiguous alphanumeric chars — no O/0, I/1, L
 _TAG_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
@@ -60,6 +70,7 @@ class Database:
             conn = await aiosqlite.connect(self.path)
             conn.row_factory = aiosqlite.Row
             await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA foreign_keys=ON")
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
@@ -91,6 +102,19 @@ class Database:
             )
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_runs_user ON runs (discord_user_id, id DESC)"
+            )
+            # Blobs live in their own table so scans of `runs` (every
+            # leaderboard query) never page through GPX payloads.
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_files (
+                    run_id     INTEGER PRIMARY KEY
+                                 REFERENCES runs(id) ON DELETE CASCADE,
+                    gpx_gz     BLOB    NOT NULL,
+                    orig_bytes INTEGER,
+                    stored_at  TEXT    DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
             await conn.execute(
                 """
@@ -161,12 +185,18 @@ class Database:
         filename: str,
         tenk_time: Optional[float] = None,
         stats: Optional[Dict[str, Any]] = None,
+        gpx_bytes: Optional[bytes] = None,
     ) -> str:
         """Insert a run and return its unique tag. Every run is kept — nothing
-        is pruned or overwritten."""
+        is pruned or overwritten.
+
+        ``gpx_bytes`` is stored gzipped so future metrics can be re-derived
+        from the original track rather than lost to whatever the parser
+        happened to compute at upload time.
+        """
         async with self._lock:
             tag = await self._unique_tag()
-            await self.conn.execute(
+            cur = await self.conn.execute(
                 """
                 INSERT INTO runs
                     (tag, discord_user_id, discord_username, run_date,
@@ -179,6 +209,15 @@ class Database:
                     json.dumps(stats) if stats else None,
                 ),
             )
+            run_id = cur.lastrowid
+            if gpx_bytes:
+                blob = gzip.compress(gpx_bytes)
+                if len(blob) <= MAX_STORED_GPX_BYTES:
+                    await self.conn.execute(
+                        "INSERT OR REPLACE INTO run_files (run_id, gpx_gz, orig_bytes) "
+                        "VALUES (?, ?, ?)",
+                        (run_id, blob, len(gpx_bytes)),
+                    )
             await self.conn.commit()
             return tag
 
@@ -300,7 +339,8 @@ class Database:
         rows = await self._fetchall(
             """
             SELECT tag, run_date, mile_time, fivek_time, tenk_time, filename,
-                   (stats_json IS NOT NULL) AS gps_verified
+                   (stats_json IS NOT NULL) AS gps_verified,
+                   EXISTS (SELECT 1 FROM run_files f WHERE f.run_id = runs.id) AS has_gpx
             FROM runs
             WHERE discord_user_id = ?
             ORDER BY id DESC
@@ -309,6 +349,91 @@ class Database:
             (discord_user_id, -1 if limit is None else limit, offset),
         )
         return [dict(row) for row in rows]
+
+    # -- stored GPX files --------------------------------------------------
+
+    async def get_gpx(self, tag: str) -> Optional[bytes]:
+        """The original GPX for a run, or None if it wasn't retained."""
+        row = await self._fetchone(
+            "SELECT f.gpx_gz FROM run_files f "
+            "JOIN runs r ON r.id = f.run_id WHERE r.tag = ?",
+            (tag.upper(),),
+        )
+        return gzip.decompress(row["gpx_gz"]) if row else None
+
+    async def iter_stored_gpx(self) -> List[Dict[str, Any]]:
+        """Every retained GPX, for bulk reprocessing.
+
+        Returns decompressed bytes; the caller is expected to parse them off
+        the event loop.
+        """
+        rows = await self._fetchall(
+            "SELECT f.run_id, r.tag, f.gpx_gz FROM run_files f "
+            "JOIN runs r ON r.id = f.run_id ORDER BY f.run_id"
+        )
+        out = []
+        for row in rows:
+            try:
+                raw = gzip.decompress(row["gpx_gz"])
+            except (OSError, EOFError):
+                continue  # corrupt blob — skip rather than abort the batch
+            out.append({"run_id": row["run_id"], "tag": row["tag"], "gpx": raw})
+        return out
+
+    async def update_run_stats(
+        self,
+        run_id: int,
+        mile_time: Optional[float],
+        fivek_time: Optional[float],
+        tenk_time: Optional[float],
+        stats: Optional[Dict[str, Any]],
+    ) -> None:
+        """Rewrite a run's derived times from a fresh parse of its GPX."""
+        async with self._lock:
+            await self.conn.execute(
+                """
+                UPDATE runs
+                SET mile_time = ?, fivek_time = ?, tenk_time = ?, stats_json = ?
+                WHERE id = ?
+                """,
+                (mile_time, fivek_time, tenk_time,
+                 json.dumps(stats) if stats else None, run_id),
+            )
+            await self.conn.commit()
+
+    async def get_storage_stats(self) -> Dict[str, Any]:
+        row = await self._fetchone(
+            "SELECT COUNT(*) AS files, "
+            "       COALESCE(SUM(LENGTH(gpx_gz)), 0) AS stored_bytes, "
+            "       COALESCE(SUM(orig_bytes), 0)     AS orig_bytes "
+            "FROM run_files"
+        )
+        total = await self._fetchone("SELECT COUNT(*) AS n FROM runs")
+        return {
+            "files": row["files"],
+            "stored_bytes": row["stored_bytes"],
+            "orig_bytes": row["orig_bytes"],
+            "total_runs": total["n"] if total else 0,
+        }
+
+    async def prune_old_gpx(self, days: int) -> int:
+        """Drop stored GPX older than ``days``. The runs themselves stay.
+
+        Retention exists because these files pin down where people live and
+        when they're out; derived stats carry no coordinates.
+        """
+        if days <= 0:
+            return 0
+        cutoff = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(days=days)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        async with self._lock:
+            cur = await self.conn.execute(
+                "DELETE FROM run_files WHERE stored_at < ?", (cutoff,)
+            )
+            await self.conn.commit()
+            return cur.rowcount or 0
 
     async def get_weekly_runs(self) -> List[Dict[str, Any]]:
         """Returns all runs uploaded in the past 7 days, newest first."""

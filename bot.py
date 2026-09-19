@@ -11,6 +11,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 import race_analysis
+import database
 from database import Database, EVENT_COLUMNS
 from formatting import fmt_time, fmt_pace_mi, pace_per_mile, parse_time
 from gpx_processor import get_run_stats
@@ -119,6 +120,11 @@ async def _maybe_send_missed_summary() -> None:
 @bot.event
 async def on_ready():
     await db.init()
+    if database.GPX_RETENTION_DAYS > 0:
+        pruned = await db.prune_old_gpx(database.GPX_RETENTION_DAYS)
+        if pruned:
+            log.info("Pruned %d GPX file(s) older than %d days.",
+                     pruned, database.GPX_RETENTION_DAYS)
     synced = await bot.tree.sync()
     log.info("Logged in as %s  |  %d slash commands synced.", bot.user, len(synced))
     if not weekly_summary.is_running():
@@ -176,6 +182,7 @@ async def upload(
         tenk_time=stats.get("tenk_time"),
         filename=gpx_file.filename,
         stats=stats,
+        gpx_bytes=raw,
     )
 
     embed = discord.Embed(
@@ -537,6 +544,7 @@ def _build_history_embed(target, runs: list, page: int, total: int) -> discord.E
             if r[EVENT_COLUMNS[key]]
         ]
         gps_badge = " 📍" if r["gps_verified"] else ""
+        gps_badge += " 💾" if r.get("has_gpx") else ""
         time_str = "  ·  ".join(parts) or "No timed segments"
         date = r["run_date"] or r["filename"] or "Unknown date"
         lines.append(f"**`{r['tag']}`** {date}{gps_badge} — {time_str}")
@@ -782,6 +790,78 @@ async def logtime(
     embed.set_footer(text=footer)
 
     await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /reprocess
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(
+    name="reprocess",
+    description="Re-derive every stored run's times from its saved GPX file.",
+)
+@app_commands.default_permissions(manage_guild=True)
+async def reprocess(interaction: discord.Interaction):
+    """Recompute times for runs whose GPX was retained.
+
+    This is what makes storing the files worth it: a new distance or a parser
+    fix can be applied to history instead of only to future uploads.
+    """
+    await interaction.response.defer(ephemeral=True)
+
+    stored = await db.iter_stored_gpx()
+    if not stored:
+        await interaction.followup.send(
+            "No stored GPX files yet. Runs uploaded from now on keep their "
+            "source file and can be reprocessed later.",
+            ephemeral=True,
+        )
+        return
+
+    changed = failed = 0
+    for entry in stored:
+        try:
+            # Parsing is CPU-bound; keep it off the event loop so the bot
+            # stays responsive through a long batch.
+            stats = await asyncio.to_thread(get_run_stats, entry["gpx"])
+        except Exception:
+            log.exception("reprocess: failed to parse %s", entry["tag"])
+            failed += 1
+            continue
+        if not stats:
+            failed += 1
+            continue
+        await db.update_run_stats(
+            entry["run_id"], stats.get("mile_time"), stats.get("fivek_time"),
+            stats.get("tenk_time"), stats,
+        )
+        changed += 1
+
+    storage = await db.get_storage_stats()
+    embed = discord.Embed(
+        title="Reprocess complete",
+        description=(
+            f"Re-derived **{changed}** run{'s' if changed != 1 else ''} from "
+            f"stored GPX."
+            + (f"\n**{failed}** could not be parsed." if failed else "")
+        ),
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text=_storage_footer(storage))
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+def _storage_footer(s: dict) -> str:
+    kept = f"{s['files']}/{s['total_runs']} runs have their GPX retained"
+    if s["stored_bytes"]:
+        mb = s["stored_bytes"] / 1e6
+        ratio = (s["orig_bytes"] / s["stored_bytes"]) if s["stored_bytes"] else 0
+        kept += f"  ·  {mb:.1f} MB stored"
+        if ratio > 1:
+            kept += f" ({ratio:.1f}x compressed)"
+    if database.GPX_RETENTION_DAYS > 0:
+        kept += f"  ·  kept {database.GPX_RETENTION_DAYS} days"
+    return kept
 
 
 # ---------------------------------------------------------------------------

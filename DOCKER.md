@@ -54,5 +54,6 @@ The container expects these to be set (via `.env` or your host environment):
 |---|---|
 | `DISCORD_TOKEN` | Bot token from the Discord developer portal |
 | `GEMINI_API_KEY` | Gemini API key for run insights |
+| `GPX_RETENTION_DAYS` | Optional. Days to keep uploaded GPX files; `0`/unset keeps them forever. |
 
-The database is stored in the `leaderboard_data` Docker volume and persists across restarts and image updates.
+The database is stored in the `leaderboard_data` Docker volume and persists across restarts and image updates. It also holds the retained GPX files, so the volume grows with uploads — budget roughly 50–150 KB per run after compression, and see the retention note in [README.md](README.md) if you'd rather not keep them indefinitely.
