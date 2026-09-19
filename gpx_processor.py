@@ -7,6 +7,7 @@ import gpxpy
 
 MILE_METERS = 1609.344
 FIVEK_METERS = 5000.0
+TENK_METERS = 10000.0
 STOP_SPEED_MS = 0.3  # m/s — below this we treat the runner as stopped
 
 
@@ -221,6 +222,7 @@ def get_run_stats(gpx_bytes: bytes) -> Dict[str, Any]:
         # Best segments
         "mile_time":  find_fastest_segment(pts, cum, MILE_METERS),
         "fivek_time": find_fastest_segment(pts, cum, FIVEK_METERS),
+        "tenk_time":  find_fastest_segment(pts, cum, TENK_METERS),
         # Splits
         "mile_splits_s":   mile_splits,
         "pace_stdev_s":    pace_stdev_s,
@@ -250,5 +252,6 @@ def process_gpx(gpx_bytes: bytes) -> Dict[str, Any]:
     return {
         "mile_time":  stats.get("mile_time"),
         "fivek_time": stats.get("fivek_time"),
+        "tenk_time":  stats.get("tenk_time"),
         "date":       stats.get("date"),
     }

@@ -1,7 +1,9 @@
+import asyncio
 import json
 import os
 import random
 from typing import Optional, List, Tuple, Dict, Any
+
 import aiosqlite
 
 DB_PATH = os.getenv("DB_PATH", "leaderboard.db")
@@ -10,18 +12,55 @@ DB_PATH = os.getenv("DB_PATH", "leaderboard.db")
 _TAG_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 _TAG_LEN = 5
 
+# Leaderboard event -> column.  Single source of truth for the event names
+# accepted by /leaderboard and stored per run.
+EVENT_COLUMNS: Dict[str, str] = {
+    "mile": "mile_time",
+    "5k": "fivek_time",
+    "10k": "tenk_time",
+}
+
+# Columns the schema must have, with their types.  Anything missing from an
+# existing database is added on startup.
+_EXPECTED_COLUMNS: Dict[str, str] = {
+    "tag": "TEXT",
+    "stats_json": "TEXT",
+    "mile_time": "REAL",
+    "fivek_time": "REAL",
+    "tenk_time": "REAL",
+}
+
 
 def _random_tag() -> str:
     return "".join(random.choices(_TAG_CHARS, k=_TAG_LEN))
 
 
 class Database:
+    """SQLite store for runs.
+
+    Holds one long-lived connection rather than reopening the file for every
+    query; ``aiosqlite`` runs it on a dedicated thread, and a lock keeps
+    concurrent commands from interleaving writes.
+    """
+
     def __init__(self, path: str = DB_PATH):
         self.path = path
+        self._conn: Optional[aiosqlite.Connection] = None
+        self._lock = asyncio.Lock()
+
+    # -- lifecycle ---------------------------------------------------------
 
     async def init(self) -> None:
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
+        """Open the connection and bring the schema up to date (idempotent —
+        ``on_ready`` fires again on every reconnect)."""
+        async with self._lock:
+            if self._conn is not None:
+                return
+
+            conn = await aiosqlite.connect(self.path)
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
                     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,29 +70,83 @@ class Database:
                     run_date         TEXT,
                     mile_time        REAL,
                     fivek_time       REAL,
+                    tenk_time        REAL,
                     filename         TEXT,
                     stats_json       TEXT,
                     uploaded_at      TEXT    DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
-            for col in ("stats_json", "tag"):
-                try:
-                    await db.execute(f"ALTER TABLE runs ADD COLUMN {col} TEXT")
-                except Exception:
-                    pass  # already exists
-            # Unique index must be created separately — SQLite forbids UNIQUE
-            # constraints in ALTER TABLE ADD COLUMN
-            await db.execute(
+
+            cur = await conn.execute("PRAGMA table_info(runs)")
+            existing = {row["name"] for row in await cur.fetchall()}
+            for col, col_type in _EXPECTED_COLUMNS.items():
+                if col not in existing:
+                    # UNIQUE can't be declared in ALTER TABLE ADD COLUMN; the
+                    # index below covers `tag`.
+                    await conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {col_type}")
+
+            await conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_tag ON runs (tag)"
             )
-            await db.commit()
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runs_user ON runs (discord_user_id, id DESC)"
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                )
+                """
+            )
+            await conn.commit()
+            self._conn = conn
 
-    async def _unique_tag(self, db) -> str:
+    async def close(self) -> None:
+        async with self._lock:
+            if self._conn is not None:
+                await self._conn.close()
+                self._conn = None
+
+    @property
+    def conn(self) -> aiosqlite.Connection:
+        if self._conn is None:
+            raise RuntimeError("Database.init() must be awaited before use.")
+        return self._conn
+
+    async def _fetchall(self, query: str, params: tuple = ()) -> List[aiosqlite.Row]:
+        async with self._lock:
+            cur = await self.conn.execute(query, params)
+            return await cur.fetchall()
+
+    async def _fetchone(self, query: str, params: tuple = ()) -> Optional[aiosqlite.Row]:
+        async with self._lock:
+            cur = await self.conn.execute(query, params)
+            return await cur.fetchone()
+
+    # -- bot state ---------------------------------------------------------
+
+    async def get_state(self, key: str) -> Optional[str]:
+        row = await self._fetchone("SELECT value FROM bot_state WHERE key = ?", (key,))
+        return row["value"] if row else None
+
+    async def set_state(self, key: str, value: str) -> None:
+        async with self._lock:
+            await self.conn.execute(
+                "INSERT INTO bot_state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            await self.conn.commit()
+
+    # -- runs --------------------------------------------------------------
+
+    async def _unique_tag(self) -> str:
         """Generate a tag that doesn't already exist in the DB."""
         for _ in range(20):
             tag = _random_tag()
-            cur = await db.execute("SELECT 1 FROM runs WHERE tag = ?", (tag,))
+            cur = await self.conn.execute("SELECT 1 FROM runs WHERE tag = ?", (tag,))
             if not await cur.fetchone():
                 return tag
         raise RuntimeError("Could not generate a unique run tag after 20 attempts.")
@@ -66,66 +159,61 @@ class Database:
         mile_time: Optional[float],
         fivek_time: Optional[float],
         filename: str,
+        tenk_time: Optional[float] = None,
         stats: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Insert a run and return its unique tag."""
-        async with aiosqlite.connect(self.path) as db:
-            tag = await self._unique_tag(db)
-            await db.execute(
+        """Insert a run and return its unique tag. Every run is kept — nothing
+        is pruned or overwritten."""
+        async with self._lock:
+            tag = await self._unique_tag()
+            await self.conn.execute(
                 """
                 INSERT INTO runs
                     (tag, discord_user_id, discord_username, run_date,
-                     mile_time, fivek_time, filename, stats_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     mile_time, fivek_time, tenk_time, filename, stats_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     tag, discord_user_id, discord_username, run_date,
-                    mile_time, fivek_time, filename,
+                    mile_time, fivek_time, tenk_time, filename,
                     json.dumps(stats) if stats else None,
                 ),
             )
-            await db.commit()
+            await self.conn.commit()
             return tag
 
     async def get_run_by_tag(self, tag: str) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute(
-                """
-                SELECT discord_user_id, discord_username, stats_json, filename
-                FROM runs WHERE tag = ?
-                """,
-                (tag.upper(),),
-            )
-            row = await cur.fetchone()
-            if not row:
-                return None
-            return {
-                "user_id":  row[0],
-                "username": row[1],
-                "stats":    json.loads(row[2]) if row[2] else None,
-                "filename": row[3],
-            }
+        row = await self._fetchone(
+            """
+            SELECT discord_user_id, discord_username, stats_json, filename
+            FROM runs WHERE tag = ?
+            """,
+            (tag.upper(),),
+        )
+        if not row:
+            return None
+        return {
+            "user_id": row["discord_user_id"],
+            "username": row["discord_username"],
+            "stats": json.loads(row["stats_json"]) if row["stats_json"] else None,
+            "filename": row["filename"],
+        }
 
     async def delete_run_by_tag(self, tag: str) -> str:
-        """
-        Delete a run by tag.  Returns:
-          'deleted'    — success
-          'not_found'  — tag doesn't exist
-        """
-        async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute(
-                "SELECT discord_user_id FROM runs WHERE tag = ?", (tag.upper(),)
+        """Delete a run by tag. Returns 'deleted' or 'not_found'."""
+        async with self._lock:
+            cur = await self.conn.execute(
+                "DELETE FROM runs WHERE tag = ?", (tag.upper(),)
             )
-            row = await cur.fetchone()
-            if not row:
-                return "not_found"
-            await db.execute("DELETE FROM runs WHERE tag = ?", (tag.upper(),))
-            await db.commit()
-            return "deleted"
+            await self.conn.commit()
+            return "deleted" if cur.rowcount else "not_found"
 
-    async def get_leaderboard(self, event: str) -> List[Tuple[str, float]]:
-        col = "mile_time" if event == "mile" else "fivek_time"
-        query = f"""
+    async def get_leaderboard(self, event: str, limit: int = 20) -> List[Tuple[str, float]]:
+        col = EVENT_COLUMNS.get(event)
+        if col is None:
+            raise ValueError(f"Unknown leaderboard event: {event!r}")
+        rows = await self._fetchall(
+            f"""
             SELECT
                 (
                     SELECT discord_username FROM runs
@@ -137,65 +225,96 @@ class Database:
             WHERE r.{col} IS NOT NULL
             GROUP BY r.discord_user_id
             ORDER BY best_time ASC
-            LIMIT 20
-        """
-        async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute(query)
-            return await cur.fetchall()
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [(row["username"], row["best_time"]) for row in rows]
 
     async def get_personal_bests(self, discord_user_id: str) -> Optional[dict]:
-        async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute(
-                """
-                SELECT MIN(mile_time), MIN(fivek_time), COUNT(*)
-                FROM runs WHERE discord_user_id = ?
-                """,
-                (discord_user_id,),
-            )
-            row = await cur.fetchone()
-            if not row or row[2] == 0:
-                return None
-            return {"mile_time": row[0], "fivek_time": row[1], "run_count": row[2]}
+        """PRs plus the summary counters the profile needs."""
+        row = await self._fetchone(
+            """
+            SELECT MIN(mile_time)  AS mile_time,
+                   MIN(fivek_time) AS fivek_time,
+                   MIN(tenk_time)  AS tenk_time,
+                   COUNT(*)        AS run_count,
+                   SUM(stats_json IS NOT NULL) AS gps_count,
+                   MIN(run_date)   AS first_date,
+                   MAX(run_date)   AS last_date
+            FROM runs WHERE discord_user_id = ?
+            """,
+            (discord_user_id,),
+        )
+        if not row or not row["run_count"]:
+            return None
+        return dict(row)
 
-    async def get_recent_runs(
-        self, discord_user_id: str, limit: int = 5
-    ) -> List[tuple]:
-        """Returns (tag, run_date, mile_time, fivek_time, filename, gps_verified) tuples."""
-        async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute(
-                """
-                SELECT tag, run_date, mile_time, fivek_time, filename,
-                       (stats_json IS NOT NULL) AS gps_verified
-                FROM runs
-                WHERE discord_user_id = ?
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (discord_user_id, limit),
-            )
-            return await cur.fetchall()
+    async def get_total_distance_km(self, discord_user_id: str) -> Optional[float]:
+        """Total GPS-recorded distance. Manual entries have no distance, so
+        this only covers uploaded runs."""
+        rows = await self._fetchall(
+            "SELECT stats_json FROM runs "
+            "WHERE discord_user_id = ? AND stats_json IS NOT NULL",
+            (discord_user_id,),
+        )
+        total = 0.0
+        for row in rows:
+            try:
+                dist = json.loads(row["stats_json"]).get("total_dist_km")
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if dist:
+                total += dist
+        return total or None
+
+    async def count_runs(self, discord_user_id: str) -> int:
+        row = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM runs WHERE discord_user_id = ?",
+            (discord_user_id,),
+        )
+        return row["n"] if row else 0
+
+    async def get_runs(
+        self, discord_user_id: str, limit: Optional[int] = None, offset: int = 0
+    ) -> List[Dict[str, Any]]:
+        """A page of a runner's history, newest first.
+
+        ``limit=None`` returns every run they've ever logged.
+        """
+        rows = await self._fetchall(
+            """
+            SELECT tag, run_date, mile_time, fivek_time, tenk_time, filename,
+                   (stats_json IS NOT NULL) AS gps_verified
+            FROM runs
+            WHERE discord_user_id = ?
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (discord_user_id, -1 if limit is None else limit, offset),
+        )
+        return [dict(row) for row in rows]
 
     async def get_weekly_runs(self) -> List[Dict[str, Any]]:
         """Returns all runs uploaded in the past 7 days, newest first."""
-        async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute(
-                """
-                SELECT discord_user_id, discord_username, run_date,
-                       mile_time, fivek_time, uploaded_at
-                FROM runs
-                WHERE uploaded_at >= datetime('now', '-7 days')
-                ORDER BY uploaded_at DESC
-                """
-            )
-            rows = await cur.fetchall()
+        rows = await self._fetchall(
+            """
+            SELECT discord_user_id, discord_username, run_date,
+                   mile_time, fivek_time, tenk_time, uploaded_at
+            FROM runs
+            WHERE uploaded_at >= datetime('now', '-7 days')
+            ORDER BY uploaded_at DESC
+            """
+        )
         return [
             {
-                "user_id":   r[0],
-                "username":  r[1],
-                "run_date":  r[2],
-                "mile_time": r[3],
-                "fivek_time": r[4],
-                "uploaded_at": r[5],
+                "user_id": r["discord_user_id"],
+                "username": r["discord_username"],
+                "run_date": r["run_date"],
+                "mile_time": r["mile_time"],
+                "fivek_time": r["fivek_time"],
+                "tenk_time": r["tenk_time"],
+                "uploaded_at": r["uploaded_at"],
             }
             for r in rows
         ]

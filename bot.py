@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import logging
 import os
@@ -9,8 +10,10 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-from database import Database
-from gpx_processor import process_gpx, get_run_stats
+import race_analysis
+from database import Database, EVENT_COLUMNS
+from formatting import fmt_time, fmt_pace_mi, pace_per_mile, parse_time
+from gpx_processor import get_run_stats
 from gemini_insights import get_insights
 
 load_dotenv()
@@ -38,53 +41,79 @@ db = Database()
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Display helpers
 # ---------------------------------------------------------------------------
 
-def fmt_time(seconds: float) -> str:
-    """Format a duration (seconds) as M:SS or H:MM:SS."""
-    s = round(seconds)
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    if h:
-        return f"{h}:{m:02d}:{sec:02d}"
-    return f"{m}:{sec:02d}"
-
-
 MEDALS = ["🥇", "🥈", "🥉"]
+
+# Event key -> (display label, emoji, metres).  Drives the leaderboard, the
+# upload/logtime embeds and the weekly summary, so a new distance only needs
+# adding here and in database.EVENT_COLUMNS.
+EVENTS = {
+    "mile": ("Mile", "🏃", race_analysis.MILE_M),
+    "5k":   ("5K",   "🏅", race_analysis.FIVE_K_M),
+    "10k":  ("10K",  "🎽", race_analysis.TEN_K_M),
+}
+
+RUNS_PER_PAGE = 8
 
 
 def rank_str(i: int) -> str:
     return MEDALS[i] if i < 3 else f"{i + 1}."
 
 
-def parse_time(value: str) -> float:
-    """
-    Parse a time string into seconds.
-    Accepts M:SS, MM:SS, H:MM:SS.
-    Raises ValueError with a user-friendly message on bad input.
-    """
-    parts = value.strip().split(":")
-    try:
-        parts = [int(p) for p in parts]
-    except ValueError:
-        raise ValueError(f"`{value}` isn't a valid time — use M:SS or H:MM:SS.")
-    if len(parts) == 2:
-        m, s = parts
-        if not (0 <= s < 60):
-            raise ValueError(f"Seconds must be 0–59, got `{s}`.")
-        return m * 60 + s
-    if len(parts) == 3:
-        h, m, s = parts
-        if not (0 <= s < 60) or not (0 <= m < 60):
-            raise ValueError(f"Use H:MM:SS format, e.g. `1:02:30`.")
-        return h * 3600 + m * 60 + s
-    raise ValueError(f"`{value}` isn't a valid time — use M:SS or H:MM:SS.")
+def _pr_fields(embed: discord.Embed, bests: dict) -> bool:
+    """Add a field per PR the runner holds. Returns True if any were added."""
+    added = False
+    for key, (label, emoji, meters) in EVENTS.items():
+        secs = bests.get(EVENT_COLUMNS[key])
+        if not secs:
+            continue
+        embed.add_field(
+            name=f"{emoji} {label}",
+            value=f"`{fmt_time(secs)}`\n{fmt_pace_mi(pace_per_mile(secs, meters))}",
+            inline=True,
+        )
+        added = True
+    return added
 
 
 # ---------------------------------------------------------------------------
 # Bot events
 # ---------------------------------------------------------------------------
+
+async def _maybe_send_missed_summary() -> None:
+    """Send the weekly summary if it was missed while the bot was offline."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    # Find the most recent Sunday at 09:00 UTC
+    days_since_sunday = (now.weekday() - 6) % 7
+    last_sunday = (now - datetime.timedelta(days=days_since_sunday)).replace(
+        hour=9, minute=0, second=0, microsecond=0
+    )
+    if last_sunday > now:
+        last_sunday -= datetime.timedelta(weeks=1)
+
+    last_sent_str = await db.get_state("last_weekly_summary_sent")
+    if last_sent_str:
+        last_sent = datetime.datetime.fromisoformat(last_sent_str)
+        if last_sent >= last_sunday:
+            return  # already sent for this week
+
+    # Bot missed the Sunday window — send now
+    try:
+        channel = bot.get_channel(SUMMARY_CHANNEL_ID) or await bot.fetch_channel(SUMMARY_CHANNEL_ID)
+    except (discord.NotFound, discord.Forbidden):
+        log.warning("_maybe_send_missed_summary: channel %d not found.", SUMMARY_CHANNEL_ID)
+        return
+
+    log.info("Sending missed weekly summary (should have fired %s).", last_sunday.isoformat())
+    embed = await _build_weekly_summary_embed()
+    if embed:
+        await channel.send(embed=embed)
+    else:
+        await channel.send("No runs logged this week — lace up and get out there! 👟")
+    await db.set_state("last_weekly_summary_sent", now.isoformat())
+
 
 @bot.event
 async def on_ready():
@@ -93,6 +122,7 @@ async def on_ready():
     log.info("Logged in as %s  |  %d slash commands synced.", bot.user, len(synced))
     if not weekly_summary.is_running():
         weekly_summary.start()
+    await _maybe_send_missed_summary()
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +172,7 @@ async def upload(
         run_date=stats.get("date"),
         mile_time=stats.get("mile_time"),
         fivek_time=stats.get("fivek_time"),
+        tenk_time=stats.get("tenk_time"),
         filename=gpx_file.filename,
         stats=stats,
     )
@@ -152,22 +183,26 @@ async def upload(
     )
     embed.set_thumbnail(url=target.display_avatar.url)
 
-    mile_t = stats.get("mile_time")
-    fivek_t = stats.get("fivek_time")
-    embed.add_field(
-        name="Fastest Mile",
-        value=fmt_time(mile_t) if mile_t else "N/A — run too short",
-        inline=True,
-    )
-    embed.add_field(
-        name="Fastest 5K",
-        value=fmt_time(fivek_t) if fivek_t else "N/A — run too short",
-        inline=True,
-    )
+    if stats.get("total_dist_km"):
+        embed.description = (
+            f"**{stats['total_dist_km']:.2f} km** "
+            f"({stats['total_dist_miles']:.2f} mi) in {fmt_time(stats.get('moving_time_s'))}"
+        )
+
+    # Fastest contiguous segments found inside this run
+    found = False
+    for key, (label, emoji, meters) in EVENTS.items():
+        secs = stats.get(EVENT_COLUMNS[key])
+        if secs:
+            embed.add_field(name=f"Fastest {label}", value=f"`{fmt_time(secs)}`", inline=True)
+            found = True
+    if not found:
+        embed.add_field(name="Fastest Mile", value="N/A — run too short", inline=True)
+
     if stats.get("date"):
         embed.add_field(name="Date", value=stats["date"], inline=True)
 
-    footer = f"Tag: {tag}  ·  Use /insights tag:{tag} to analyse"
+    footer = f"Tag: {tag}  ·  /insights tag:{tag} to analyse  ·  /profile to see predictions"
     if runner and runner != interaction.user:
         footer += f"  ·  Uploaded by {interaction.user.display_name}"
     embed.set_footer(text=footer)
@@ -303,111 +338,366 @@ async def _send_insights(
 # ---------------------------------------------------------------------------
 
 @bot.tree.command(name="leaderboard", description="Show the fastest times leaderboard.")
-@app_commands.describe(event="Mile or 5K leaderboard.")
+@app_commands.describe(event="Mile, 5K or 10K — omit to show all three.")
 @app_commands.choices(
     event=[
         app_commands.Choice(name="Mile", value="mile"),
         app_commands.Choice(name="5K", value="5k"),
+        app_commands.Choice(name="10K", value="10k"),
     ]
 )
-async def leaderboard(interaction: discord.Interaction, event: str = "mile"):
-    rows = await db.get_leaderboard(event)
+async def leaderboard(interaction: discord.Interaction, event: str = None):
+    keys = [event] if event else list(EVENTS)
+    results = await asyncio.gather(*(db.get_leaderboard(k) for k in keys))
 
-    if not rows:
+    if not any(results):
         await interaction.response.send_message(
             "No times on the board yet. Upload a run with `/upload`!"
         )
         return
 
-    label = "Mile" if event == "mile" else "5K"
-    embed = discord.Embed(
-        title=f"🏃 Fastest {label} Times",
-        color=discord.Color.orange(),
-    )
+    if event:
+        label, emoji, _ = EVENTS[event]
+        embed = discord.Embed(
+            title=f"{emoji} Fastest {label} Times", color=discord.Color.orange()
+        )
+        embed.description = "\n".join(
+            f"{rank_str(i)}  **{u}** — `{fmt_time(t)}`"
+            for i, (u, t) in enumerate(results[0])
+        )
+    else:
+        embed = discord.Embed(title="🏃 Leaderboard", color=discord.Color.orange())
+        for key, rows in zip(keys, results):
+            if not rows:
+                continue
+            label, emoji, _ = EVENTS[key]
+            embed.add_field(
+                name=f"{emoji} {label}",
+                value="\n".join(
+                    f"{rank_str(i)}  **{u}** — `{fmt_time(t)}`"
+                    for i, (u, t) in enumerate(rows)
+                ),
+                inline=True,
+            )
+        embed.set_footer(text="/profile for predictions and runner type")
 
-    lines = [
-        f"{rank_str(i)}  **{username}** — `{fmt_time(t)}`"
-        for i, (username, t) in enumerate(rows)
-    ]
-    embed.description = "\n".join(lines)
     await interaction.response.send_message(embed=embed)
 
 
 # ---------------------------------------------------------------------------
-# /pb  (personal bests)
+# Profile embeds — shared by /profile, /pb and /runs
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(name="pb", description="Show personal bests for a runner.")
-@app_commands.describe(runner="Whose PBs to look up (defaults to you).")
-async def pb(interaction: discord.Interaction, runner: discord.Member = None):
-    target = runner or interaction.user
-    bests = await db.get_personal_bests(str(target.id))
-
-    if not bests:
-        await interaction.response.send_message(
-            f"No runs recorded for **{target.display_name}** yet."
-        )
-        return
-
+def _build_overview_embed(target, bests: dict, profile: dict, total_km) -> discord.Embed:
     embed = discord.Embed(
-        title=f"Personal Bests — {target.display_name}",
+        title=f"Profile — {target.display_name}",
         color=discord.Color.blue(),
     )
     embed.set_thumbnail(url=target.display_avatar.url)
 
-    if bests["mile_time"]:
-        embed.add_field(name="🏃 Fastest Mile", value=f"`{fmt_time(bests['mile_time'])}`", inline=True)
-    if bests["fivek_time"]:
-        embed.add_field(name="🏅 Fastest 5K", value=f"`{fmt_time(bests['fivek_time'])}`", inline=True)
+    if not _pr_fields(embed, bests):
+        embed.description = "No timed segments yet — log a mile, 5K or 10K to unlock predictions."
 
-    embed.add_field(name="Runs logged", value=str(bests["run_count"]), inline=True)
-    await interaction.response.send_message(embed=embed)
-
-
-# ---------------------------------------------------------------------------
-# /runs  (recent run history)
-# ---------------------------------------------------------------------------
-
-@bot.tree.command(name="runs", description="Show recent runs for a runner.")
-@app_commands.describe(runner="Whose runs to show (defaults to you).")
-async def runs(interaction: discord.Interaction, runner: discord.Member = None):
-    target = runner or interaction.user
-    recent = await db.get_recent_runs(str(target.id))
-
-    if not recent:
-        await interaction.response.send_message(
-            f"No runs recorded for **{target.display_name}** yet."
+    rtype = profile.get("runner_type")
+    if rtype:
+        embed.add_field(
+            name=f"{rtype['emoji']} Runner Type: {rtype['label']}",
+            value=(
+                f"{rtype['blurb']}\n*Fade exponent k = {profile['k']:.2f} — read from "
+                f"your PRs, so it's sharpest when those came from real hard efforts "
+                f"rather than segments inside an easy run.*"
+            ),
+            inline=False,
         )
-        return
+    elif profile["efforts"]:
+        embed.add_field(
+            name="🧭 Runner Type",
+            value=(
+                "Needs PRs at **two different distances** to work out how you fade "
+                "as races get longer. Log another distance with `/logtime`."
+            ),
+            inline=False,
+        )
 
+    summary = [f"**{bests['run_count']}** run{'s' if bests['run_count'] != 1 else ''} logged"]
+    if bests["gps_count"]:
+        summary.append(f"**{bests['gps_count']}** GPS-verified 📍")
+    if total_km:
+        summary.append(f"**{total_km:.1f} km** tracked")
+    if profile.get("vdot"):
+        summary.append(f"VDOT **{profile['vdot']:.1f}**")
+    if profile.get("cs_pace_s_mi"):
+        summary.append(f"threshold ~**{fmt_pace_mi(profile['cs_pace_s_mi'])}**")
+    embed.add_field(name="📊 Stats", value="  ·  ".join(summary), inline=False)
+
+    if bests["first_date"] and bests["last_date"]:
+        span = bests["first_date"]
+        if bests["last_date"] != bests["first_date"]:
+            span += f" → {bests['last_date']}"
+        embed.set_footer(text=f"Active {span}")
+    return embed
+
+
+def _build_predictions_embed(target, profile: dict) -> discord.Embed:
     embed = discord.Embed(
-        title=f"Recent Runs — {target.display_name}",
+        title=f"Race Predictions — {target.display_name}",
+        color=discord.Color.gold(),
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+
+    if not profile["efforts"]:
+        embed.description = (
+            "No times recorded yet. Upload a run with `/upload` or log one with "
+            "`/logtime` to get predictions."
+        )
+        return embed
+
+    rows = ["Distance     Time       Pace", "─" * 32]
+    for p in profile["predictions"]:
+        secs = p["actual"] or p["time"]
+        # Without a personal exponent every prediction is a guess off the
+        # textbook curve, so flag the lot rather than just the long throws.
+        trusted = p["reliable"] and profile["k_is_personal"]
+        mark = "★" if p["actual"] else (" " if trusted else "~")
+        rows.append(
+            f"{p['label']:<9}{fmt_time(secs):>8} {mark}  "
+            f"{fmt_pace_mi(pace_per_mile(secs, p['meters'])):>8}"
+        )
+    embed.description = "```\n" + "\n".join(rows) + "\n```★ your PR   ~ rough extrapolation"
+
+    if profile["k_is_personal"]:
+        anchors = ", ".join(e["label"] for e in profile["efforts"])
+        model = (
+            f"Riegel fitted to **your own** {anchors} PR"
+            f"{'s' if len(profile['efforts']) > 1 else ''} — "
+            f"exponent **k = {profile['k']:.2f}**.\n"
+            f"Textbook Riegel uses {race_analysis.RIEGEL_K}; most recreational "
+            f"runners sit near **1.10–1.18**. The higher your k, the more you "
+            f"fade as races get longer."
+        )
+        span = profile.get("riegel_gap_span")
+        if span and profile.get("riegel_gap_pct") is not None:
+            model += (
+                f"\nOver **{span[0]} → {span[1]}** you run "
+                f"**{profile['riegel_gap_pct']:+.0f}%** against a flat "
+                f"k={race_analysis.RIEGEL_K} curve."
+            )
+    else:
+        model = (
+            f"Only one distance on record, so these use the **textbook** Riegel "
+            f"exponent k = {race_analysis.RIEGEL_K}. Log a second distance and the "
+            f"model retunes to how *you* actually fade."
+        )
+    embed.add_field(name="📐 Model", value=model, inline=False)
+
+    if profile.get("cs_pace_s_mi"):
+        embed.add_field(
+            name="🎯 Training paces",
+            value=(
+                f"Threshold / tempo ≈ **{fmt_pace_mi(profile['cs_pace_s_mi'])}** "
+                f"(critical speed, D′ {profile['d_prime_m']:.0f} m)"
+            ),
+            inline=False,
+        )
+
+    embed.set_footer(
+        text="Predictions assume equivalent training and effort at every distance."
+    )
+    return embed
+
+
+def _build_history_embed(target, runs: list, page: int, total: int) -> discord.Embed:
+    pages = max(1, -(-total // RUNS_PER_PAGE))
+    embed = discord.Embed(
+        title=f"Run History — {target.display_name}",
         color=discord.Color.blurple(),
     )
 
     lines = []
-    for tag, date, mile, fivek, fname, gps_verified in recent:
-        parts = []
-        if mile:
-            parts.append(f"Mile: `{fmt_time(mile)}`")
-        if fivek:
-            parts.append(f"5K: `{fmt_time(fivek)}`")
-        gps_badge = " 📍" if gps_verified else ""
+    for r in runs:
+        parts = [
+            f"{label}: `{fmt_time(r[EVENT_COLUMNS[key]])}`"
+            for key, (label, _, _) in EVENTS.items()
+            if r[EVENT_COLUMNS[key]]
+        ]
+        gps_badge = " 📍" if r["gps_verified"] else ""
         time_str = "  ·  ".join(parts) or "No timed segments"
-        lines.append(f"**`{tag}`** {date or fname or 'Unknown date'}{gps_badge} — {time_str}")
-    embed.description = "\n".join(lines)
+        date = r["run_date"] or r["filename"] or "Unknown date"
+        lines.append(f"**`{r['tag']}`** {date}{gps_badge} — {time_str}")
+    embed.description = "\n".join(lines) or "No runs recorded yet."
 
-    await interaction.response.send_message(embed=embed)
+    embed.set_footer(text=f"Page {page + 1}/{pages}  ·  {total} run{'s' if total != 1 else ''} total")
+    return embed
+
+
+class ProfileView(discord.ui.View):
+    """Tabbed profile: overview, predictions and a paged run history."""
+
+    def __init__(self, target, bests: dict, profile: dict, total_km, total_runs: int,
+                 page: str = "overview"):
+        super().__init__(timeout=300)
+        self.target = target
+        self.bests = bests
+        self.profile = profile
+        self.total_km = total_km
+        self.total_runs = total_runs
+        self.history_page = 0
+        self.message: discord.Message | None = None
+        self.page = page
+        self._sync_buttons()
+
+    # -- state -------------------------------------------------------------
+
+    def _sync_buttons(self) -> None:
+        """Grey out the current tab and hide paging outside the history tab."""
+        on_history = self.page == "history"
+        pages = max(1, -(-self.total_runs // RUNS_PER_PAGE))
+        for item in self.children:
+            cid = getattr(item, "custom_id", None)
+            if cid in ("overview", "predictions", "history"):
+                item.disabled = cid == self.page
+                item.style = (
+                    discord.ButtonStyle.primary if cid == self.page
+                    else discord.ButtonStyle.secondary
+                )
+            elif cid == "prev":
+                item.disabled = not on_history or self.history_page == 0
+            elif cid == "next":
+                item.disabled = not on_history or self.history_page >= pages - 1
+
+    async def _render(self, interaction: discord.Interaction) -> None:
+        if self.page == "overview":
+            embed = _build_overview_embed(self.target, self.bests, self.profile, self.total_km)
+        elif self.page == "predictions":
+            embed = _build_predictions_embed(self.target, self.profile)
+        else:
+            runs = await db.get_runs(
+                str(self.target.id),
+                limit=RUNS_PER_PAGE,
+                offset=self.history_page * RUNS_PER_PAGE,
+            )
+            embed = _build_history_embed(self.target, runs, self.history_page, self.total_runs)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def initial_embed(self) -> discord.Embed:
+        if self.page == "overview":
+            return _build_overview_embed(self.target, self.bests, self.profile, self.total_km)
+        if self.page == "predictions":
+            return _build_predictions_embed(self.target, self.profile)
+        runs = await db.get_runs(str(self.target.id), limit=RUNS_PER_PAGE)
+        return _build_history_embed(self.target, runs, 0, self.total_runs)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    # -- buttons -----------------------------------------------------------
+
+    @discord.ui.button(label="Overview", custom_id="overview", row=0)
+    async def overview_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.page = "overview"
+        await self._render(interaction)
+
+    @discord.ui.button(label="Predictions", custom_id="predictions", row=0)
+    async def predictions_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.page = "predictions"
+        await self._render(interaction)
+
+    @discord.ui.button(label="History", custom_id="history", row=0)
+    async def history_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.page = "history"
+        self.history_page = 0
+        await self._render(interaction)
+
+    @discord.ui.button(label="◀", custom_id="prev", row=1)
+    async def prev_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.history_page = max(0, self.history_page - 1)
+        await self._render(interaction)
+
+    @discord.ui.button(label="▶", custom_id="next", row=1)
+    async def next_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.history_page += 1
+        await self._render(interaction)
+
+
+async def _send_profile(interaction: discord.Interaction, runner, page: str) -> None:
+    """Load a runner's data once and hand it to a ProfileView."""
+    target = runner or interaction.user
+    bests, total_km = await asyncio.gather(
+        db.get_personal_bests(str(target.id)),
+        db.get_total_distance_km(str(target.id)),
+    )
+
+    if not bests:
+        await interaction.response.send_message(
+            f"No runs recorded for **{target.display_name}** yet. "
+            "Upload one with `/upload` or log a time with `/logtime`."
+        )
+        return
+
+    profile = race_analysis.build_profile(bests)
+    view = ProfileView(target, bests, profile, total_km, bests["run_count"], page=page)
+    await interaction.response.send_message(embed=await view.initial_embed(), view=view)
+    view.message = await interaction.original_response()
+
+
+# ---------------------------------------------------------------------------
+# /profile, /pb, /runs
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(
+    name="profile",
+    description="Full runner profile: PRs, race predictions, runner type and run history.",
+)
+@app_commands.describe(runner="Whose profile to show (defaults to you).")
+async def profile(interaction: discord.Interaction, runner: discord.Member = None):
+    await _send_profile(interaction, runner, "overview")
+
+
+@bot.tree.command(name="pb", description="Show personal bests for a runner.")
+@app_commands.describe(runner="Whose PBs to look up (defaults to you).")
+async def pb(interaction: discord.Interaction, runner: discord.Member = None):
+    await _send_profile(interaction, runner, "overview")
+
+
+@bot.tree.command(name="runs", description="Show a runner's full run history.")
+@app_commands.describe(runner="Whose runs to show (defaults to you).")
+async def runs(interaction: discord.Interaction, runner: discord.Member = None):
+    await _send_profile(interaction, runner, "history")
+
+
+@bot.tree.command(
+    name="predict",
+    description="Race-time predictions from a runner's PRs (Riegel, tuned to them).",
+)
+@app_commands.describe(runner="Whose predictions to show (defaults to you).")
+async def predict(interaction: discord.Interaction, runner: discord.Member = None):
+    await _send_profile(interaction, runner, "predictions")
 
 
 # ---------------------------------------------------------------------------
 # /logtime
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(name="logtime", description="Manually log a mile and/or 5K time without a GPX file.")
+# Event key -> (min seconds, max seconds) sanity bounds for manual entry
+_TIME_BOUNDS = {
+    "mile": (60, 3600),
+    "5k": (600, 7200),
+    "10k": (1200, 14400),
+}
+
+
+@bot.tree.command(name="logtime", description="Manually log a mile, 5K and/or 10K time without a GPX file.")
 @app_commands.describe(
     mile="Fastest mile time, e.g. 7:30",
     fivek="Fastest 5K time, e.g. 25:00",
+    tenk="Fastest 10K time, e.g. 55:00",
     runner="Who ran this? Defaults to you.",
     date="Date of the run (YYYY-MM-DD). Defaults to today.",
 )
@@ -415,47 +705,47 @@ async def logtime(
     interaction: discord.Interaction,
     mile: str = None,
     fivek: str = None,
+    tenk: str = None,
     runner: discord.Member = None,
     date: str = None,
 ):
-    if mile is None and fivek is None:
+    raw = {"mile": mile, "5k": fivek, "10k": tenk}
+    if not any(raw.values()):
         await interaction.response.send_message(
-            "Provide at least one time — `mile`, `fivek`, or both.", ephemeral=True
+            "Provide at least one time — `mile`, `fivek` or `tenk`.", ephemeral=True
         )
         return
 
-    mile_s = fivek_s = None
-    try:
-        if mile:
-            mile_s = parse_time(mile)
-        if fivek:
-            fivek_s = parse_time(fivek)
-    except ValueError as e:
-        await interaction.response.send_message(str(e), ephemeral=True)
-        return
+    times: dict[str, float] = {}
+    for key, value in raw.items():
+        if not value:
+            continue
+        label = EVENTS[key][0]
+        try:
+            secs = parse_time(value)
+        except ValueError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+        lo, hi = _TIME_BOUNDS[key]
+        if not (lo <= secs <= hi):
+            await interaction.response.send_message(
+                f"That {label} time doesn't look right — it must be between "
+                f"`{fmt_time(lo)}` and `{fmt_time(hi)}`.",
+                ephemeral=True,
+            )
+            return
+        times[key] = secs
 
     target = runner or interaction.user
-
-    # Basic sanity checks
-    if mile_s is not None and not (60 <= mile_s <= 3600):
-        await interaction.response.send_message(
-            "That mile time doesn't look right (must be between 1:00 and 60:00).", ephemeral=True
-        )
-        return
-    if fivek_s is not None and not (600 <= fivek_s <= 7200):
-        await interaction.response.send_message(
-            "That 5K time doesn't look right (must be between 10:00 and 2:00:00).", ephemeral=True
-        )
-        return
-
     run_date = date or discord.utils.utcnow().strftime("%Y-%m-%d")
 
     tag = await db.add_run(
         discord_user_id=str(target.id),
         discord_username=target.display_name,
         run_date=run_date,
-        mile_time=mile_s,
-        fivek_time=fivek_s,
+        mile_time=times.get("mile"),
+        fivek_time=times.get("5k"),
+        tenk_time=times.get("10k"),
         filename="manual entry",
         stats=None,
     )
@@ -465,13 +755,12 @@ async def logtime(
         color=discord.Color.green(),
     )
     embed.set_thumbnail(url=target.display_avatar.url)
-    if mile_s:
-        embed.add_field(name="Mile", value=f"`{fmt_time(mile_s)}`", inline=True)
-    if fivek_s:
-        embed.add_field(name="5K", value=f"`{fmt_time(fivek_s)}`", inline=True)
+    for key, secs in times.items():
+        label, emoji, _ = EVENTS[key]
+        embed.add_field(name=f"{emoji} {label}", value=f"`{fmt_time(secs)}`", inline=True)
     embed.add_field(name="Date", value=run_date, inline=True)
 
-    footer = f"Tag: {tag}"
+    footer = f"Tag: {tag}  ·  /profile to see your predictions"
     if runner and runner != interaction.user:
         footer += f"  ·  Logged by {interaction.user.display_name}"
     embed.set_footer(text=footer)
@@ -510,20 +799,16 @@ async def _build_weekly_summary_embed() -> discord.Embed | None:
     # Group by user
     runners: dict[str, dict] = {}
     for r in rows:
-        uid = r["user_id"]
-        if uid not in runners:
-            runners[uid] = {
-                "username": r["username"],
-                "run_count": 0,
-                "best_mile": None,
-                "best_fivek": None,
-            }
-        entry = runners[uid]
+        entry = runners.setdefault(
+            r["user_id"],
+            {"username": r["username"], "run_count": 0, "best": {}},
+        )
         entry["run_count"] += 1
-        if r["mile_time"] and (entry["best_mile"] is None or r["mile_time"] < entry["best_mile"]):
-            entry["best_mile"] = r["mile_time"]
-        if r["fivek_time"] and (entry["best_fivek"] is None or r["fivek_time"] < entry["best_fivek"]):
-            entry["best_fivek"] = r["fivek_time"]
+        for key in EVENTS:
+            col = EVENT_COLUMNS[key]
+            t = r[col]
+            if t and (entry["best"].get(key) is None or t < entry["best"][key]):
+                entry["best"][key] = t
 
     total_runs = len(rows)
     total_runners = len(runners)
@@ -543,11 +828,11 @@ async def _build_weekly_summary_embed() -> discord.Embed | None:
     for entry in sorted(runners.values(), key=lambda e: e["run_count"], reverse=True):
         run_word = "run" if entry["run_count"] == 1 else "runs"
         parts = [f"**{entry['username']}** — {entry['run_count']} {run_word}"]
-        times = []
-        if entry["best_mile"]:
-            times.append(f"mile `{fmt_time(entry['best_mile'])}`")
-        if entry["best_fivek"]:
-            times.append(f"5K `{fmt_time(entry['best_fivek'])}`")
+        times = [
+            f"{EVENTS[key][0]} `{fmt_time(entry['best'][key])}`"
+            for key in EVENTS
+            if entry["best"].get(key)
+        ]
         if times:
             parts.append("(" + ", ".join(times) + ")")
         lines.append(" ".join(parts))
@@ -559,26 +844,20 @@ async def _build_weekly_summary_embed() -> discord.Embed | None:
     most_active = max(runners.values(), key=lambda e: e["run_count"])
     if most_active["run_count"] > 1:
         shoutouts.append(
-            f"**Most dedicated:** {most_active['username']} with {most_active['run_count']} runs — consistency wins! 🔥"
+            f"**Most dedicated:** {most_active['username']} with "
+            f"{most_active['run_count']} runs — consistency wins! 🔥"
         )
-    fastest_mile = min(
-        (e for e in runners.values() if e["best_mile"]),
-        key=lambda e: e["best_mile"],
-        default=None,
-    )
-    if fastest_mile:
-        shoutouts.append(
-            f"**Fastest mile this week:** {fastest_mile['username']} — `{fmt_time(fastest_mile['best_mile'])}` 🥇"
+    for key, (label, emoji, _) in EVENTS.items():
+        fastest = min(
+            (e for e in runners.values() if e["best"].get(key)),
+            key=lambda e: e["best"][key],
+            default=None,
         )
-    fastest_fivek = min(
-        (e for e in runners.values() if e["best_fivek"]),
-        key=lambda e: e["best_fivek"],
-        default=None,
-    )
-    if fastest_fivek:
-        shoutouts.append(
-            f"**Fastest 5K this week:** {fastest_fivek['username']} — `{fmt_time(fastest_fivek['best_fivek'])}` 🏅"
-        )
+        if fastest:
+            shoutouts.append(
+                f"**Fastest {label} this week:** {fastest['username']} — "
+                f"`{fmt_time(fastest['best'][key])}` {emoji}"
+            )
 
     if shoutouts:
         embed.add_field(name="Shoutouts", value="\n".join(shoutouts), inline=False)
@@ -592,8 +871,9 @@ async def weekly_summary():
     if datetime.datetime.now(datetime.timezone.utc).weekday() != 6:  # 6 = Sunday
         return
 
-    channel = bot.get_channel(SUMMARY_CHANNEL_ID)
-    if channel is None:
+    try:
+        channel = bot.get_channel(SUMMARY_CHANNEL_ID) or await bot.fetch_channel(SUMMARY_CHANNEL_ID)
+    except (discord.NotFound, discord.Forbidden):
         log.warning("weekly_summary: channel %d not found.", SUMMARY_CHANNEL_ID)
         return
 
@@ -602,6 +882,10 @@ async def weekly_summary():
         await channel.send(embed=embed)
     else:
         await channel.send("No runs logged this week — lace up and get out there! 👟")
+    await db.set_state(
+        "last_weekly_summary_sent",
+        datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +900,6 @@ async def weekly_summary_cmd(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed)
     else:
         await interaction.followup.send("No runs logged in the past 7 days.")
-
 
 
 # ---------------------------------------------------------------------------

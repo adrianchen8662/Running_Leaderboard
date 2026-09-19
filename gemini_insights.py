@@ -6,28 +6,9 @@ from typing import Dict, Any
 
 from google import genai
 
+from formatting import fmt_time as _fmt_time, fmt_pace_km as _fmt_pace_km, fmt_pace_mi as _fmt_pace_mi
+
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-
-# ---------------------------------------------------------------------------
-# Formatting helpers
-# ---------------------------------------------------------------------------
-
-def _fmt_time(s: float) -> str:
-    s = round(s)
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
-
-
-def _fmt_pace_mi(s_per_mile: float) -> str:
-    m, sec = divmod(round(s_per_mile), 60)
-    return f"{m}:{sec:02d}/mi"
-
-
-def _fmt_pace_km(s_per_km: float) -> str:
-    m, sec = divmod(round(s_per_km), 60)
-    return f"{m}:{sec:02d}/km"
 
 
 # ---------------------------------------------------------------------------
@@ -69,12 +50,15 @@ def _build_prompt(stats: Dict[str, Any], runner_name: str) -> str:
 
     mile_t = stats.get("mile_time")
     fivek_t = stats.get("fivek_time")
-    if mile_t or fivek_t:
+    tenk_t = stats.get("tenk_time")
+    if mile_t or fivek_t or tenk_t:
         lines += ["", "**Best Segments (fastest contiguous)**"]
         if mile_t:
             lines.append(f"- Fastest mile: {_fmt_time(mile_t)}  ({_fmt_pace_mi(mile_t)} pace)")
         if fivek_t:
             lines.append(f"- Fastest 5 K:  {_fmt_time(fivek_t)}  ({_fmt_pace_km(fivek_t / 5)} pace)")
+        if tenk_t:
+            lines.append(f"- Fastest 10 K: {_fmt_time(tenk_t)}  ({_fmt_pace_km(tenk_t / 10)} pace)")
 
     splits = stats.get("mile_splits_s", [])
     if splits:
