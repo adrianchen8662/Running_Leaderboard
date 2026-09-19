@@ -177,6 +177,41 @@ def classify_runner(k: Optional[float]) -> Optional[Dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Effort quality
+# ---------------------------------------------------------------------------
+
+# PROVISIONAL — these thresholds are literature-shaped starting points, not
+# calibrated against this group's runs, which is why effort quality is shown
+# on the profile but does NOT yet gate the prediction model. Calibrate against
+# runs known to be hard before wiring it into build_profile().
+HR_FRACTION_HARD = 0.90   # of the runner's observed max HR
+PACE_RATIO_HARD = 1.15    # window speed vs. that run's average speed
+COVERAGE_HARD = 0.80      # window distance vs. the whole run (a time trial)
+
+
+def effort_quality(effort: Dict, runner_max_hr: Optional[float] = None) -> str:
+    """Judge whether a best-effort window looks like a genuine hard effort.
+
+    Returns ``"hard"``, ``"easy"`` or ``"unknown"``. Heart rate is the
+    strongest signal; pace ratio is the fallback when a file has no HR.
+    Coverage is what rescues a dedicated time trial, whose pace ratio is flat
+    by definition because the effort *was* the whole run.
+    """
+    hr = effort.get("avg_hr")
+    if hr and runner_max_hr:
+        return "hard" if hr >= runner_max_hr * HR_FRACTION_HARD else "easy"
+
+    coverage = effort.get("coverage")
+    if coverage and coverage >= COVERAGE_HARD:
+        return "hard"
+
+    ratio = effort.get("pace_ratio")
+    if ratio is not None:
+        return "hard" if ratio >= PACE_RATIO_HARD else "easy"
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Profile assembly
 # ---------------------------------------------------------------------------
 

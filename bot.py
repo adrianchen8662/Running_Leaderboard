@@ -554,16 +554,70 @@ def _build_history_embed(target, runs: list, page: int, total: int) -> discord.E
     return embed
 
 
+_QUALITY_MARK = {"hard": "🔥", "easy": "〰️", "unknown": "·"}
+
+
+def _build_efforts_embed(target, envelope: list, max_hr) -> discord.Embed:
+    """The runner's best-effort envelope — fastest window at each distance
+    across every run, with how hard that window looked."""
+    embed = discord.Embed(
+        title=f"Best Efforts — {target.display_name}",
+        color=discord.Color.teal(),
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+
+    if not envelope:
+        embed.description = (
+            "No GPS runs yet. Best efforts are pulled from uploaded GPX files — "
+            "times entered with `/logtime` are recorded as PRs but have no track "
+            "to search."
+        )
+        return embed
+
+    rows = ["Dist       Time     HR   Effort", "─" * 34]
+    for e in envelope:
+        quality = race_analysis.effort_quality(e, max_hr)
+        hr = f"{e['avg_hr']:.0f}" if e.get("avg_hr") else "—"
+        rows.append(
+            f"{e['label']:<9}{fmt_time(e['time_s']):>8}{hr:>6}   "
+            f"{_QUALITY_MARK[quality]}"
+        )
+    embed.description = "```\n" + "\n".join(rows) + "\n```"
+
+    legend = "🔥 looks like a real effort   〰️ likely from an easy run"
+    if max_hr:
+        legend += f"\nJudged against your observed max HR of **{max_hr:.0f}** bpm."
+    else:
+        legend += (
+            "\nNo heart-rate data, so this falls back to how much faster the "
+            "window was than the rest of the run."
+        )
+    embed.add_field(name="Reading this", value=legend, inline=False)
+    embed.add_field(
+        name="⚠️ Not used for predictions yet",
+        value=(
+            "These thresholds haven't been calibrated against your group's runs. "
+            "Predictions still come from your recorded PRs. Check whether the "
+            "🔥 marks match runs you know were hard — that's what calibrates them."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"{len(envelope)} distances  ·  from your uploaded GPX runs")
+    return embed
+
+
 class ProfileView(discord.ui.View):
     """Tabbed profile: overview, predictions and a paged run history."""
 
     def __init__(self, target, bests: dict, profile: dict, dist: dict, total_runs: int,
-                 page: str = "overview"):
+                 envelope: list = None, max_hr=None, page: str = "overview"):
         super().__init__(timeout=300)
         self.target = target
         self.bests = bests
         self.profile = profile
         self.dist = dist
+        self.envelope = envelope or []
+        self.max_hr = max_hr
         self.total_runs = total_runs
         self.history_page = 0
         self.message: discord.Message | None = None
@@ -578,7 +632,7 @@ class ProfileView(discord.ui.View):
         pages = max(1, -(-self.total_runs // RUNS_PER_PAGE))
         for item in self.children:
             cid = getattr(item, "custom_id", None)
-            if cid in ("overview", "predictions", "history"):
+            if cid in ("overview", "predictions", "history", "efforts"):
                 item.disabled = cid == self.page
                 item.style = (
                     discord.ButtonStyle.primary if cid == self.page
@@ -594,6 +648,8 @@ class ProfileView(discord.ui.View):
             embed = _build_overview_embed(self.target, self.bests, self.profile, self.dist)
         elif self.page == "predictions":
             embed = _build_predictions_embed(self.target, self.profile)
+        elif self.page == "efforts":
+            embed = _build_efforts_embed(self.target, self.envelope, self.max_hr)
         else:
             runs = await db.get_runs(
                 str(self.target.id),
@@ -609,6 +665,8 @@ class ProfileView(discord.ui.View):
             return _build_overview_embed(self.target, self.bests, self.profile, self.dist)
         if self.page == "predictions":
             return _build_predictions_embed(self.target, self.profile)
+        if self.page == "efforts":
+            return _build_efforts_embed(self.target, self.envelope, self.max_hr)
         runs = await db.get_runs(str(self.target.id), limit=RUNS_PER_PAGE)
         return _build_history_embed(self.target, runs, 0, self.total_runs)
 
@@ -633,6 +691,11 @@ class ProfileView(discord.ui.View):
         self.page = "predictions"
         await self._render(interaction)
 
+    @discord.ui.button(label="Efforts", custom_id="efforts", row=0)
+    async def efforts_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.page = "efforts"
+        await self._render(interaction)
+
     @discord.ui.button(label="History", custom_id="history", row=0)
     async def history_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
         self.page = "history"
@@ -653,10 +716,14 @@ class ProfileView(discord.ui.View):
 async def _send_profile(interaction: discord.Interaction, runner, page: str) -> None:
     """Load a runner's data once and hand it to a ProfileView."""
     target = runner or interaction.user
-    bests, dist = await asyncio.gather(
+    bests, dist, envelope = await asyncio.gather(
         db.get_personal_bests(str(target.id)),
         db.get_distance_stats(str(target.id)),
+        db.get_effort_envelope(str(target.id)),
     )
+    # Observed max HR across every stored effort — the yardstick for judging
+    # whether a given window was actually hard.
+    max_hr = max((e["max_hr"] for e in envelope if e.get("max_hr")), default=None)
 
     if not bests:
         await interaction.response.send_message(
@@ -666,7 +733,8 @@ async def _send_profile(interaction: discord.Interaction, runner, page: str) -> 
         return
 
     profile = race_analysis.build_profile(bests)
-    view = ProfileView(target, bests, profile, dist, bests["run_count"], page=page)
+    view = ProfileView(target, bests, profile, dist, bests["run_count"],
+                       envelope=envelope, max_hr=max_hr, page=page)
     await interaction.response.send_message(embed=await view.initial_embed(), view=view)
     view.message = await interaction.original_response()
 
@@ -694,6 +762,15 @@ async def pb(interaction: discord.Interaction, runner: discord.Member = None):
 @app_commands.describe(runner="Whose runs to show (defaults to you).")
 async def runs(interaction: discord.Interaction, runner: discord.Member = None):
     await _send_profile(interaction, runner, "history")
+
+
+@bot.tree.command(
+    name="efforts",
+    description="Your fastest window at every distance, and how hard each looked.",
+)
+@app_commands.describe(runner="Whose best efforts to show (defaults to you).")
+async def efforts(interaction: discord.Interaction, runner: discord.Member = None):
+    await _send_profile(interaction, runner, "efforts")
 
 
 @bot.tree.command(

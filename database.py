@@ -116,6 +116,29 @@ class Database:
                 )
                 """
             )
+            # One row per run per ladder rung. The per-runner MIN over this
+            # table is the envelope (mean-maximal pace curve) the models
+            # should eventually be fitted to.
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS best_efforts (
+                    run_id     INTEGER NOT NULL
+                                 REFERENCES runs(id) ON DELETE CASCADE,
+                    meters     REAL    NOT NULL,
+                    label      TEXT,
+                    time_s     REAL    NOT NULL,
+                    avg_hr     REAL,
+                    max_hr     REAL,
+                    pace_ratio REAL,
+                    coverage   REAL,
+                    PRIMARY KEY (run_id, meters)
+                )
+                """
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_best_efforts_meters "
+                "ON best_efforts (meters, time_s)"
+            )
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bot_state (
@@ -210,6 +233,8 @@ class Database:
                 ),
             )
             run_id = cur.lastrowid
+            if stats and stats.get("best_efforts"):
+                await self._write_best_efforts(run_id, stats["best_efforts"])
             if gpx_bytes:
                 blob = gzip.compress(gpx_bytes)
                 if len(blob) <= MAX_STORED_GPX_BYTES:
@@ -350,6 +375,53 @@ class Database:
         )
         return [dict(row) for row in rows]
 
+    async def _write_best_efforts(self, run_id: int, efforts: List[Dict[str, Any]]) -> None:
+        """Replace a run's ladder rows. Caller must hold the lock."""
+        await self.conn.execute("DELETE FROM best_efforts WHERE run_id = ?", (run_id,))
+        await self.conn.executemany(
+            """
+            INSERT INTO best_efforts
+                (run_id, meters, label, time_s, avg_hr, max_hr, pace_ratio, coverage)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (run_id, e["meters"], e.get("label"), e["time_s"], e.get("avg_hr"),
+                 e.get("max_hr"), e.get("pace_ratio"), e.get("coverage"))
+                for e in efforts
+            ],
+        )
+
+    async def get_effort_envelope(self, discord_user_id: str) -> List[Dict[str, Any]]:
+        """A runner's fastest window at each ladder distance, across all runs.
+
+        Each row carries the effort signals from the run that set it, so a
+        later effort gate can judge whether it was a real effort without
+        reparsing anything.
+        """
+        rows = await self._fetchall(
+            """
+            SELECT b.meters, b.label, b.time_s, b.avg_hr, b.max_hr,
+                   b.pace_ratio, b.coverage, r.tag, r.run_date,
+                   (SELECT COUNT(*) FROM best_efforts b2
+                    JOIN runs r2 ON r2.id = b2.run_id
+                    WHERE r2.discord_user_id = r.discord_user_id
+                      AND b2.meters = b.meters) AS samples
+            FROM best_efforts b
+            JOIN runs r ON r.id = b.run_id
+            WHERE r.discord_user_id = ?
+              AND b.time_s = (
+                    SELECT MIN(b3.time_s) FROM best_efforts b3
+                    JOIN runs r3 ON r3.id = b3.run_id
+                    WHERE r3.discord_user_id = r.discord_user_id
+                      AND b3.meters = b.meters
+              )
+            GROUP BY b.meters
+            ORDER BY b.meters
+            """,
+            (discord_user_id,),
+        )
+        return [dict(r) for r in rows]
+
     # -- stored GPX files --------------------------------------------------
 
     async def get_gpx(self, tag: str) -> Optional[bytes]:
@@ -399,6 +471,8 @@ class Database:
                 (mile_time, fivek_time, tenk_time,
                  json.dumps(stats) if stats else None, run_id),
             )
+            if stats and stats.get("best_efforts"):
+                await self._write_best_efforts(run_id, stats["best_efforts"])
             await self.conn.commit()
 
     async def get_storage_stats(self) -> Dict[str, Any]:

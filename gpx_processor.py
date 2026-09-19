@@ -8,6 +8,15 @@ import gpxpy
 MILE_METERS = 1609.344
 FIVEK_METERS = 5000.0
 TENK_METERS = 10000.0
+
+# Ladder of distances we extract a fastest window for on every run. The
+# per-runner minimum across these (the "envelope", or mean-maximal pace curve)
+# is a far better basis for modelling than three isolated PRs.
+BEST_EFFORT_LADDER = [
+    ("400m", 400.0), ("800m", 800.0), ("1K", 1000.0), ("1600m", 1600.0),
+    ("Mile", MILE_METERS), ("3K", 3000.0), ("5K", FIVEK_METERS),
+    ("10K", TENK_METERS), ("15K", 15000.0), ("Half", 21097.5),
+]
 STOP_SPEED_MS = 0.3  # m/s — below this we treat the runner as stopped
 
 
@@ -29,17 +38,22 @@ def haversine(p1, p2) -> float:
 # Fastest-segment (Strava-style sliding window)
 # ---------------------------------------------------------------------------
 
-def find_fastest_segment(pts: list, cum: list, target_m: float) -> Optional[float]:
+def find_fastest_window(pts: list, cum: list, target_m: float):
     """
     Two-pointer sliding window over pre-built cumulative distances.
     Linear interpolation at the trailing edge for sub-second accuracy.
-    Returns seconds, or None if the run is shorter than target_m.
+
+    Returns ``(seconds, start_idx, end_idx)`` for the fastest window, or None
+    if the run is shorter than target_m. The indices let callers measure what
+    was happening during the effort — heart rate above all — which is what
+    separates a genuine hard effort from the least-slow stretch of a jog.
     """
     n = len(pts)
     if n < 2 or cum[-1] < target_m:
         return None
 
     best = float("inf")
+    best_i = best_j = 0
     j = 0
     for i in range(n):
         if j <= i:
@@ -59,10 +73,16 @@ def find_fastest_segment(pts: list, cum: list, target_m: float) -> Optional[floa
             time_adj = 0.0
 
         elapsed = (pts[j].time - pts[i].time).total_seconds() - time_adj
-        if elapsed > 0:
-            best = min(best, elapsed)
+        if elapsed > 0 and elapsed < best:
+            best, best_i, best_j = elapsed, i, j
 
-    return best if best != float("inf") else None
+    return (best, best_i, best_j) if best != float("inf") else None
+
+
+def find_fastest_segment(pts: list, cum: list, target_m: float) -> Optional[float]:
+    """Seconds for the fastest ``target_m`` window, or None."""
+    found = find_fastest_window(pts, cum, target_m)
+    return found[0] if found else None
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +182,47 @@ def _elevation_stats(pts: list) -> Dict[str, Optional[float]]:
     return {"gain_m": gain, "loss_m": loss, "min_m": min(elevs), "max_m": max(elevs)}
 
 
+def _best_efforts(pts: list, cum: list, hrs: List[Optional[float]],
+                  moving_s: float) -> List[Dict[str, Any]]:
+    """Fastest window at every rung of the ladder, with effort signals.
+
+    A fastest window is only a PR if the runner was actually trying. Three
+    signals are recorded per rung so that judgement can be made later (and
+    recalibrated) without re-parsing anything:
+
+    ``avg_hr``      mean heart rate during the window
+    ``pace_ratio``  window speed / run average speed — a hard effort inside an
+                    easy run spikes; the least-slow kilometre of a jog doesn't
+    ``coverage``    window distance / total run distance — near 1.0 means the
+                    run *was* the effort, which is why a dedicated time trial
+                    shows a flat pace_ratio and must not be read as easy
+    """
+    total_m = cum[-1]
+    run_speed = (total_m / moving_s) if moving_s > 0 else None
+    efforts = []
+
+    for label, target_m in BEST_EFFORT_LADDER:
+        found = find_fastest_window(pts, cum, target_m)
+        if not found:
+            continue
+        secs, i, j = found
+        if secs <= 0:
+            continue
+
+        seg_hrs = [h for h in hrs[i:j + 1] if h is not None]
+        seg_speed = target_m / secs
+        efforts.append({
+            "label": label,
+            "meters": target_m,
+            "time_s": secs,
+            "avg_hr": (sum(seg_hrs) / len(seg_hrs)) if seg_hrs else None,
+            "max_hr": max(seg_hrs) if seg_hrs else None,
+            "pace_ratio": (seg_speed / run_speed) if run_speed else None,
+            "coverage": (target_m / total_m) if total_m else None,
+        })
+    return efforts
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -197,7 +258,8 @@ def get_run_stats(gpx_bytes: bytes) -> Dict[str, Any]:
     mile_splits = _mile_splits(pts, cum)
     elev = _elevation_stats(pts)
 
-    hrs  = [h for h in (_heart_rate(p)   for p in pts) if h is not None]
+    hr_per_point = [_heart_rate(p) for p in pts]
+    hrs  = [h for h in hr_per_point if h is not None]
     cads = [c for c in (_cadence(p)      for p in pts) if c is not None]
     temps = [t for t in (_temperature(p) for p in pts) if t is not None]
 
@@ -219,6 +281,8 @@ def get_run_stats(gpx_bytes: bytes) -> Dict[str, Any]:
         # Pace
         "avg_pace_s_km":   avg_pace_s_km,
         "avg_pace_s_mi":   avg_pace_s_mi,
+        # Full best-effort ladder (feeds the per-runner envelope)
+        "best_efforts": _best_efforts(pts, cum, hr_per_point, moving_s),
         # Best segments
         "mile_time":  find_fastest_segment(pts, cum, MILE_METERS),
         "fivek_time": find_fastest_segment(pts, cum, FIVEK_METERS),

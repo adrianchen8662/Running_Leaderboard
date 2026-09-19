@@ -19,7 +19,8 @@ No Strava account required for anyone. Export a GPX from your watch, drop it in 
 | `/runs [runner:]` | Jump straight to the paged run history. |
 | `/insights [tag:] [gpx_file:] [runner:]` | Gemini analysis of a stored run (by tag) or an attached GPX. |
 | `/remove tag:` | Delete a run by its tag — removes its stored GPX too. |
-| `/reprocess` | Re-derive every stored run's times from its saved GPX. Requires **Manage Server**. |
+| `/efforts [runner:]` | Fastest window at every distance from your GPX runs, with how hard each looked. |
+| `/reprocess` | Re-derive every stored run's times and best efforts from its saved GPX. Requires **Manage Server**. |
 | `/weekly_summary` | Preview the Sunday wrap-up in the current channel. |
 
 Every run gets a short **tag** (e.g. `AB3KQ`) shown on upload and in `/runs` — that's what `/insights` and `/remove` take.
@@ -68,6 +69,28 @@ Also computed:
 - PRs may come from different dates and different fitness levels.
 
 `python3 race_analysis.py` prints the models over a sample leaderboard — handy as a sanity check after touching the math.
+
+---
+
+## Best efforts and the effort envelope
+
+Every GPX upload is searched for its fastest window at ten distances — 400m, 800m, 1K, 1600m, mile, 3K, 5K, 10K, 15K, half. The per-runner minimum at each distance is the **envelope** (a mean-maximal pace curve): your best-ever effort at every duration, not just three isolated PRs. `/efforts` shows it.
+
+### Why effort quality is recorded
+
+A fastest window is only a PR if you were trying. The bias runs one way — a segment is never faster than you can run, but it's often slower than you *could* — so distances you never push are silently understated, which flattens the prediction curve and pushes the runner-type classification toward Endurance Monster. Feeding a jogged 1K into the model moves a Speedster (k=1.22) to Endurance Monster (k=1.09).
+
+So each effort stores three signals:
+
+| Signal | What it catches |
+|---|---|
+| `avg_hr` | Strongest signal. A real effort sits near max HR; a jogged kilometre doesn't. |
+| `pace_ratio` | Fallback when a file has no HR — how much faster the window was than the rest of the run. |
+| `coverage` | Window distance ÷ run distance. Rescues a dedicated time trial, whose pace ratio is flat *by definition* because the effort was the whole run. |
+
+**These do not yet gate predictions.** The thresholds in `race_analysis.effort_quality` are literature-shaped starting points, not calibrated against real runs. `/efforts` marks each distance 🔥 or 〰️ so you can check the marks against runs you know were hard — that's the calibration step, and until it's done predictions continue to come from recorded PRs.
+
+Times entered with `/logtime` have no track to search, so they produce no envelope. They're treated as self-reported efforts and feed the model directly.
 
 ---
 
