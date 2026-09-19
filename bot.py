@@ -160,7 +160,7 @@ async def upload(
 
     try:
         raw = await gpx_file.read()
-        stats = get_run_stats(raw)
+        stats = await asyncio.to_thread(get_run_stats, raw)
     except Exception:
         log.exception("Unhandled error:")
         await interaction.followup.send(
@@ -315,7 +315,7 @@ async def insights_cmd(
 
     try:
         raw = await gpx_file.read()
-        stats = get_run_stats(raw)
+        stats = await asyncio.to_thread(get_run_stats, raw)
     except Exception:
         log.exception("Unhandled error:")
         await interaction.followup.send("Failed to parse the GPX file.")
@@ -944,7 +944,7 @@ async def attach(
 
     try:
         raw = await gpx_file.read()
-        stats = get_run_stats(raw)
+        stats = await asyncio.to_thread(get_run_stats, raw)
     except Exception:
         log.exception("attach: parse failed")
         await interaction.followup.send("Failed to parse the GPX file.")

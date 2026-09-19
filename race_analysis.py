@@ -22,7 +22,8 @@ Run ``python3 race_analysis.py`` to verify the math against known values.
 import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
-MILE_M = 1609.344
+from formatting import MILE_M
+
 FIVE_K_M = 5000.0
 TEN_K_M = 10000.0
 

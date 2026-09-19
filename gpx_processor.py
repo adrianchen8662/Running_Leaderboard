@@ -5,7 +5,7 @@ from typing import Optional, Dict, Any, List
 
 import gpxpy
 
-MILE_METERS = 1609.344
+from formatting import MILE_M as MILE_METERS
 FIVEK_METERS = 5000.0
 TENK_METERS = 10000.0
 
@@ -263,6 +263,11 @@ def get_run_stats(gpx_bytes: bytes) -> Dict[str, Any]:
     cads = [c for c in (_cadence(p)      for p in pts) if c is not None]
     temps = [t for t in (_temperature(p) for p in pts) if t is not None]
 
+    # The ladder already searches every distance we report, so the headline
+    # mile/5K/10K are read off it rather than searched a second time.
+    efforts = _best_efforts(pts, cum, hr_per_point, moving_s)
+    by_distance = {e["meters"]: e["time_s"] for e in efforts}
+
     # Per-mile pace variance — how consistent was the runner?
     pace_stdev_s = statistics.stdev(mile_splits) if len(mile_splits) >= 2 else None
 
@@ -282,11 +287,11 @@ def get_run_stats(gpx_bytes: bytes) -> Dict[str, Any]:
         "avg_pace_s_km":   avg_pace_s_km,
         "avg_pace_s_mi":   avg_pace_s_mi,
         # Full best-effort ladder (feeds the per-runner envelope)
-        "best_efforts": _best_efforts(pts, cum, hr_per_point, moving_s),
-        # Best segments
-        "mile_time":  find_fastest_segment(pts, cum, MILE_METERS),
-        "fivek_time": find_fastest_segment(pts, cum, FIVEK_METERS),
-        "tenk_time":  find_fastest_segment(pts, cum, TENK_METERS),
+        "best_efforts": efforts,
+        # Headline segments, read off the ladder rather than searched again
+        "mile_time":  by_distance.get(MILE_METERS),
+        "fivek_time": by_distance.get(FIVEK_METERS),
+        "tenk_time":  by_distance.get(TENK_METERS),
         # Splits
         "mile_splits_s":   mile_splits,
         "pace_stdev_s":    pace_stdev_s,
@@ -304,18 +309,4 @@ def get_run_stats(gpx_bytes: bytes) -> Dict[str, Any]:
         "avg_cadence_spm": (sum(cads) / len(cads)) if cads else None,
         # Temperature
         "avg_temp_c": (sum(temps) / len(temps)) if temps else None,
-    }
-
-
-def process_gpx(gpx_bytes: bytes) -> Dict[str, Any]:
-    """
-    Thin wrapper kept for backward compatibility with the upload/leaderboard flow.
-    Returns only the fields the database needs.
-    """
-    stats = get_run_stats(gpx_bytes)
-    return {
-        "mile_time":  stats.get("mile_time"),
-        "fivek_time": stats.get("fivek_time"),
-        "tenk_time":  stats.get("tenk_time"),
-        "date":       stats.get("date"),
     }
