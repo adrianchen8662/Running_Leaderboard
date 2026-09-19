@@ -422,6 +422,105 @@ class Database:
         )
         return [dict(r) for r in rows]
 
+    async def find_matching_run(
+        self,
+        discord_user_id: str,
+        run_date: Optional[str],
+        dist_km: Optional[float],
+        duration_s: Optional[float],
+        tolerance: float = 0.02,
+    ) -> Optional[Dict[str, Any]]:
+        """Find an existing run that looks like the same activity.
+
+        Used so a GPX can be re-uploaded to backfill its source file without
+        creating a second record. Matching is deliberately strict: same day,
+        and both distance and duration within ``tolerance``. Runs with no
+        stored stats (manual entries) are never matched automatically — a
+        date alone isn't enough to risk overwriting the wrong run, so those
+        need /attach with an explicit tag.
+        """
+        if not run_date or not dist_km or not duration_s:
+            return None
+
+        rows = await self._fetchall(
+            """
+            SELECT id, tag, filename, stats_json,
+                   (SELECT 1 FROM run_files f WHERE f.run_id = runs.id) AS has_gpx
+            FROM runs
+            WHERE discord_user_id = ? AND run_date = ? AND stats_json IS NOT NULL
+            """,
+            (discord_user_id, run_date),
+        )
+        for row in rows:
+            try:
+                st = json.loads(row["stats_json"])
+            except (ValueError, TypeError):
+                continue
+            d, t = st.get("total_dist_km"), st.get("total_time_s")
+            if not d or not t:
+                continue
+            if (abs(d - dist_km) / dist_km <= tolerance
+                    and abs(t - duration_s) / duration_s <= tolerance):
+                return {
+                    "id": row["id"], "tag": row["tag"],
+                    "filename": row["filename"],
+                    "has_gpx": bool(row["has_gpx"]),
+                }
+        return None
+
+    async def get_run_row_by_tag(self, tag: str) -> Optional[Dict[str, Any]]:
+        row = await self._fetchone(
+            "SELECT id, tag, discord_user_id, filename, run_date, "
+            "       (SELECT 1 FROM run_files f WHERE f.run_id = runs.id) AS has_gpx "
+            "FROM runs WHERE tag = ?",
+            (tag.upper(),),
+        )
+        return dict(row) if row else None
+
+    async def attach_gpx(
+        self,
+        run_id: int,
+        gpx_bytes: bytes,
+        stats: Optional[Dict[str, Any]] = None,
+        overwrite_times: bool = True,
+    ) -> bool:
+        """Attach a GPX to an existing run, refreshing what it derives.
+
+        ``overwrite_times=False`` keeps the run's recorded mile/5K/10K — used
+        for manual entries, where the typed time is a deliberate statement
+        (an official race result, say) and shouldn't be silently replaced by
+        whatever a re-parsed track computes.
+
+        Returns False if the file was too large to store.
+        """
+        blob = gzip.compress(gpx_bytes)
+        if len(blob) > MAX_STORED_GPX_BYTES:
+            return False
+
+        async with self._lock:
+            await self.conn.execute(
+                "INSERT OR REPLACE INTO run_files (run_id, gpx_gz, orig_bytes) "
+                "VALUES (?, ?, ?)",
+                (run_id, blob, len(gpx_bytes)),
+            )
+            if stats:
+                if overwrite_times:
+                    await self.conn.execute(
+                        "UPDATE runs SET mile_time = ?, fivek_time = ?, "
+                        "tenk_time = ?, stats_json = ? WHERE id = ?",
+                        (stats.get("mile_time"), stats.get("fivek_time"),
+                         stats.get("tenk_time"), json.dumps(stats), run_id),
+                    )
+                else:
+                    await self.conn.execute(
+                        "UPDATE runs SET stats_json = ? WHERE id = ?",
+                        (json.dumps(stats), run_id),
+                    )
+                if stats.get("best_efforts"):
+                    await self._write_best_efforts(run_id, stats["best_efforts"])
+            await self.conn.commit()
+        return True
+
     # -- stored GPX files --------------------------------------------------
 
     async def get_gpx(self, tag: str) -> Optional[bytes]:

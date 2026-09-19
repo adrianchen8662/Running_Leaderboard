@@ -141,12 +141,14 @@ async def on_ready():
     gpx_file="GPX file exported from Strava or any GPS app.",
     runner="Who ran this? Tag someone else if you're uploading on their behalf.",
     insights="Ask Gemini for a coaching analysis of this run (requires GEMINI_API_KEY).",
+    force_new="Record as a new run even if it matches one already logged.",
 )
 async def upload(
     interaction: discord.Interaction,
     gpx_file: discord.Attachment,
     runner: discord.Member = None,
     insights: bool = False,
+    force_new: bool = False,
 ):
     await interaction.response.defer()
 
@@ -171,6 +173,42 @@ async def upload(
             "No valid timed GPS segments found. "
             "The run may be too short, or the GPX file is missing timestamps."
         )
+        return
+
+    # Re-uploading an old run to backfill its GPX must not create a second
+    # record, so look for the same activity before inserting.
+    match = None if force_new else await db.find_matching_run(
+        str(target.id), stats.get("date"),
+        stats.get("total_dist_km"), stats.get("total_time_s"),
+    )
+
+    if match:
+        stored = await db.attach_gpx(match["id"], raw, stats, overwrite_times=True)
+        tag = match["tag"]
+        embed = discord.Embed(
+            title=f"Matched an existing run for {target.display_name}",
+            description=(
+                f"This is the same activity as **`{tag}`** "
+                f"({stats.get('date')}), so it was updated in place rather "
+                f"than logged twice."
+                + ("" if stored else "\n⚠️ The file was too large to store.")
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.set_thumbnail(url=target.display_avatar.url)
+        embed.add_field(
+            name="What changed",
+            value=(
+                ("✅ GPX stored — this run can now be reprocessed\n" if stored else "")
+                + "✅ Best-effort ladder recorded\n"
+                + "✅ Times refreshed from the track"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text=f"Tag: {tag}  ·  Pass force_new: True to log it separately")
+        await interaction.followup.send(embed=embed)
+        if insights:
+            await _send_insights(interaction, stats, target)
         return
 
     tag = await db.add_run(
@@ -867,6 +905,88 @@ async def logtime(
     embed.set_footer(text=footer)
 
     await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /attach
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(
+    name="attach",
+    description="Attach a GPX file to a run you already logged, by its tag.",
+)
+@app_commands.describe(
+    tag="The run to attach it to (shown in /runs).",
+    gpx_file="The GPX for that run.",
+    overwrite_times="Replace the run's recorded times with ones from the track.",
+)
+async def attach(
+    interaction: discord.Interaction,
+    tag: str,
+    gpx_file: discord.Attachment,
+    overwrite_times: bool = False,
+):
+    """Backfill a GPX onto an existing run.
+
+    The explicit counterpart to /upload's automatic matching — for manual
+    entries, which are never auto-matched, and for anything the matcher
+    misses.
+    """
+    await interaction.response.defer()
+
+    row = await db.get_run_row_by_tag(tag)
+    if not row:
+        await interaction.followup.send(f"No run found with tag `{tag.upper()}`.")
+        return
+    if not gpx_file.filename.lower().endswith(".gpx"):
+        await interaction.followup.send("Please upload a `.gpx` file.")
+        return
+
+    try:
+        raw = await gpx_file.read()
+        stats = get_run_stats(raw)
+    except Exception:
+        log.exception("attach: parse failed")
+        await interaction.followup.send("Failed to parse the GPX file.")
+        return
+    if not stats:
+        await interaction.followup.send("No valid timed GPS data in that file.")
+        return
+
+    was_manual = row.get("filename") == "manual entry"
+    # A hand-entered time is a deliberate statement — often an official race
+    # result that beats whatever a re-parsed track computes — so keep it
+    # unless asked otherwise.
+    keep_times = was_manual and not overwrite_times
+
+    stored = await db.attach_gpx(
+        row["id"], raw, stats, overwrite_times=not keep_times
+    )
+    if not stored:
+        await interaction.followup.send(
+            "That file is too large to store (8 MB compressed limit)."
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"GPX attached to `{row['tag']}`",
+        color=discord.Color.green(),
+    )
+    lines = ["✅ GPX stored — this run can now be reprocessed",
+             "✅ Best-effort ladder recorded"]
+    if keep_times:
+        lines.append(
+            f"↩️ Kept your logged times (the track says "
+            f"{fmt_time(stats.get('mile_time')) if stats.get('mile_time') else '—'} "
+            f"for the mile). Pass `overwrite_times: True` to use the track instead."
+        )
+    else:
+        lines.append("✅ Times refreshed from the track")
+    embed.description = "\n".join(lines)
+
+    if row.get("has_gpx"):
+        embed.set_footer(text="This run already had a GPX — it was replaced.")
+    await interaction.followup.send(embed=embed)
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ No Strava account required for anyone. Export a GPX from your watch, drop it in 
 | `/insights [tag:] [gpx_file:] [runner:]` | Gemini analysis of a stored run (by tag) or an attached GPX. |
 | `/remove tag:` | Delete a run by its tag — removes its stored GPX too. |
 | `/efforts [runner:]` | Fastest window at every distance from your GPX runs, with how hard each looked. |
+| `/attach tag: gpx_file:` | Attach a GPX to a run you already logged — backfills its source file without duplicating the run. |
 | `/reprocess` | Re-derive every stored run's times and best efforts from its saved GPX. Requires **Manage Server**. |
 | `/weekly_summary` | Preview the Sunday wrap-up in the current channel. |
 
@@ -91,6 +92,24 @@ So each effort stores three signals:
 **These do not yet gate predictions.** The thresholds in `race_analysis.effort_quality` are literature-shaped starting points, not calibrated against real runs. `/efforts` marks each distance 🔥 or 〰️ so you can check the marks against runs you know were hard — that's the calibration step, and until it's done predictions continue to come from recorded PRs.
 
 Times entered with `/logtime` have no track to search, so they produce no envelope. They're treated as self-reported efforts and feed the model directly.
+
+---
+
+## Backfilling GPX for past runs
+
+Runs logged before GPX retention existed have no source file, so they have no best-effort ladder and can't be reprocessed. You can backfill them by re-uploading the original files.
+
+**`/upload` will not duplicate a run.** Before inserting, it looks for an existing run by the same person on the same date whose distance *and* duration both match within 2%. On a match it updates that run in place — stores the GPX, records the ladder, refreshes the times — and tells you which run it matched. Pass `force_new: True` if you really did run twice.
+
+Matching is deliberately strict, so it handles the awkward cases:
+
+- Two different runs on the same day stay separate; re-uploading either one finds the right record.
+- A Garmin export that differs slightly from the original Strava export still matches.
+- **Manual `/logtime` entries are never auto-matched.** A date alone isn't enough to risk overwriting the wrong run, so use `/attach` with the tag for those.
+
+**`/attach tag: gpx_file:`** is the explicit version, for manual entries and anything the matcher misses. On a manual entry it keeps your typed times by default — a hand-entered time is usually a deliberate statement (an official race result that beats what a re-parsed track computes), so it isn't silently replaced. Pass `overwrite_times: True` to use the track's numbers instead.
+
+After backfilling, run `/reprocess` to rebuild derived data across everything at once.
 
 ---
 
